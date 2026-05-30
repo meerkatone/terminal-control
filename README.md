@@ -2,6 +2,9 @@
 
 Native terminal visual capture for agents, TUI developers, and review workflows.
 
+[![crates.io](https://img.shields.io/crates/v/cellshot.svg)](https://crates.io/crates/cellshot)
+[![CI](https://github.com/kitlangton/cellshot/actions/workflows/ci.yml/badge.svg)](https://github.com/kitlangton/cellshot/actions/workflows/ci.yml)
+
 `cellshot` runs terminal programs at explicit dimensions, interprets their terminal state, and exports reviewable artifacts:
 
 - SVG screenshots with foreground/background styling.
@@ -13,6 +16,28 @@ Native terminal visual capture for agents, TUI developers, and review workflows.
 PNG artifacts render at 2x pixel density by default for sharp HiDPI viewing. SVG artifacts remain resolution-independent.
 
 `cellshot` supports both a concise one-shot capture path and named persistent sessions for multi-step terminal interaction.
+
+## See It Work
+
+This is OpenCode, captured by `cellshot` while asking OpenCode to write haikus about being captured by `cellshot`:
+
+![OpenCode answering a playful request for cellshot haikus](https://raw.githubusercontent.com/kitlangton/cellshot/main/docs/screenshots/opencode-haikus.png)
+
+The same persistent session before interaction:
+
+![OpenCode home screen rendered by cellshot](https://raw.githubusercontent.com/kitlangton/cellshot/main/docs/screenshots/opencode-home.png)
+
+Both images were produced from one live TUI process using the session API:
+
+```bash
+cellshot launch --name meta --host opentui --cols 112 --rows 35 -- opencode
+cellshot wait meta "Ask anything"
+cellshot snapshot meta --hide-cursor --out docs/screenshots/opencode-home
+cellshot send meta 'text:Write exactly three tiny haikus about cellshot photographing OpenCode while you answer. Start with the exact words Pixel paparazzi. Keep it playful and do not use tools.' enter
+cellshot wait meta "Shutter clicks, code froze." --timeout-ms 60000
+cellshot snapshot meta --hide-cursor --out docs/screenshots/opencode-haikus
+cellshot close meta
+```
 
 ## Requirements
 
@@ -35,7 +60,7 @@ Update an existing installation:
 cargo install --force cellshot
 ```
 
-Collaborators with access to the private GitHub repository can also install the current source head:
+Install the current GitHub source head instead of the latest registry release:
 
 ```bash
 cargo install --locked --git https://github.com/kitlangton/cellshot cellshot
@@ -180,17 +205,9 @@ Implemented now:
 - SVG, PNG, JSON, text, and ANSI artifact output.
 - HiDPI PNG export (`--pixel-ratio`, default `2`).
 
-## OpenCode Proof Capture
+## OpenTUI Support
 
-The MVP has been used to run a real OpenCode TUI, answer its OpenTUI terminal startup handshake, open dialogs by sending keyboard events, and capture PNG artifacts:
-
-```text
-captures/opencode-home-vector-hidpi.png
-captures/opencode-command-palette-vector-hidpi.png
-captures/opencode-provider-dialog-vector-hidpi.png
-```
-
-The host-handshake logic is currently intentionally narrow: it identifies the OpenTUI startup query sequence and returns a dark-theme capability response sufficient for visual capture. It should become a general terminal-host implementation before this tool is published as a universal automation replacement.
+`--host opentui` responds to the startup, palette, and graphics capability probes used by current OpenTUI applications such as OpenCode. It is deliberately opt-in so generic terminal commands are not given application-specific host responses. The terminal-host layer should continue to broaden before treating `cellshot` as a universal automation terminal.
 
 Next layers:
 

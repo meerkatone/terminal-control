@@ -12,6 +12,8 @@ use vt100::Parser;
 use crate::frame::{DEFAULT_BACKGROUND, DEFAULT_FOREGROUND, Frame, from_screen};
 
 const OPENTUI_QUERY: &[u8] = b"\x1b]10;?\x07\x1b]11;?\x07";
+const PALETTE_QUERY: &[u8] = b"\x1b]4;0;?\x07";
+const KITTY_QUERY: &[u8] = b"\x1b_Gi=31337";
 
 pub struct Options {
     pub cols: u16,
@@ -261,6 +263,8 @@ pub(crate) struct Host {
     writer: Box<dyn Write + Send>,
     enabled: bool,
     opentui_replied: bool,
+    palette_replied: bool,
+    kitty_replied: bool,
     probe: Vec<u8>,
     pixel_width: u32,
     pixel_height: u32,
@@ -272,6 +276,8 @@ impl Host {
             writer,
             enabled: options.opentui_host,
             opentui_replied: false,
+            palette_replied: false,
+            kitty_replied: false,
             probe: Vec::new(),
             pixel_width: u32::from(options.cols) * u32::from(options.cell_width),
             pixel_height: u32::from(options.rows) * u32::from(options.cell_height),
@@ -286,46 +292,67 @@ impl Host {
     }
 
     pub(crate) fn respond(&mut self, output: &[u8]) -> Result<()> {
-        if !self.enabled || self.opentui_replied {
+        if !self.enabled {
             return Ok(());
         }
         self.probe.extend_from_slice(output);
-        if !self
-            .probe
-            .windows(OPENTUI_QUERY.len())
-            .any(|window| window == OPENTUI_QUERY)
+        if !self.opentui_replied
+            && self
+                .probe
+                .windows(OPENTUI_QUERY.len())
+                .any(|window| window == OPENTUI_QUERY)
         {
-            let retain = OPENTUI_QUERY.len().saturating_sub(1);
-            if self.probe.len() > retain {
-                self.probe.drain(..self.probe.len() - retain);
-            }
-            return Ok(());
-        }
-        self.writer
-            .write_all(
-                format!(
-                     "\x1b]10;rgb:{:02x}{:02x}/{:02x}{:02x}/{:02x}{:02x}\x1b\\\x1b]11;rgb:{:02x}{:02x}/{:02x}{:02x}/{:02x}{:02x}\x1b\\\x1bP>|cellshot {}\x1b\\\x1b[1;1R\x1b[?1016;0$y\x1b[?2027;0$y\x1b[?2031;2$y\x1b[?1004;1$y\x1b[?2004;2$y\x1b[?2026;2$y\x1b[?0u\x1b[1;1R\x1b[1;1R\x1b[4;{};{}t\x1b[?6c",
-                     DEFAULT_FOREGROUND.r,
-                     DEFAULT_FOREGROUND.r,
-                     DEFAULT_FOREGROUND.g,
-                     DEFAULT_FOREGROUND.g,
-                     DEFAULT_FOREGROUND.b,
-                     DEFAULT_FOREGROUND.b,
-                     DEFAULT_BACKGROUND.r,
-                     DEFAULT_BACKGROUND.r,
-                     DEFAULT_BACKGROUND.g,
-                     DEFAULT_BACKGROUND.g,
-                     DEFAULT_BACKGROUND.b,
-                     DEFAULT_BACKGROUND.b,
-                     env!("CARGO_PKG_VERSION"),
-                     self.pixel_height,
-                     self.pixel_width,
+            self.writer
+                .write_all(
+                    format!(
+                        "\x1b]10;rgb:{:02x}{:02x}/{:02x}{:02x}/{:02x}{:02x}\x1b\\\x1b]11;rgb:{:02x}{:02x}/{:02x}{:02x}/{:02x}{:02x}\x1b\\\x1bP>|cellshot {}\x1b\\\x1b[1;1R\x1b[?1016;0$y\x1b[?2027;0$y\x1b[?2031;2$y\x1b[?1004;1$y\x1b[?2004;2$y\x1b[?2026;2$y\x1b[?0u\x1b[1;1R\x1b[1;1R\x1b[4;{};{}t\x1b[?6c",
+                        DEFAULT_FOREGROUND.r,
+                        DEFAULT_FOREGROUND.r,
+                        DEFAULT_FOREGROUND.g,
+                        DEFAULT_FOREGROUND.g,
+                        DEFAULT_FOREGROUND.b,
+                        DEFAULT_FOREGROUND.b,
+                        DEFAULT_BACKGROUND.r,
+                        DEFAULT_BACKGROUND.r,
+                        DEFAULT_BACKGROUND.g,
+                        DEFAULT_BACKGROUND.g,
+                        DEFAULT_BACKGROUND.b,
+                        DEFAULT_BACKGROUND.b,
+                        env!("CARGO_PKG_VERSION"),
+                        self.pixel_height,
+                        self.pixel_width,
+                    )
+                    .as_bytes(),
                 )
-                .as_bytes(),
-            )
-            .context("write OpenTUI host response")?;
+                .context("write OpenTUI host response")?;
+            self.opentui_replied = true;
+        }
+        if !self.palette_replied
+            && self
+                .probe
+                .windows(PALETTE_QUERY.len())
+                .any(|window| window == PALETTE_QUERY)
+        {
+            self.writer
+                .write_all(b"\x1b]4;0;rgb:0000/0000/0000\x1b\\")
+                .context("write OpenTUI palette response")?;
+            self.palette_replied = true;
+        }
+        if !self.kitty_replied
+            && self
+                .probe
+                .windows(KITTY_QUERY.len())
+                .any(|window| window == KITTY_QUERY)
+        {
+            self.writer
+                .write_all(b"\x1b_Gi=31337;OK\x1b\\")
+                .context("write OpenTUI graphics response")?;
+            self.kitty_replied = true;
+        }
         self.writer.flush().context("flush OpenTUI host response")?;
-        self.opentui_replied = true;
+        if self.probe.len() > 64 {
+            self.probe.drain(..self.probe.len() - 64);
+        }
         Ok(())
     }
 }
@@ -370,8 +397,13 @@ mod tests {
 
         host.respond(b"\x1b]10;?\x07").unwrap();
         host.respond(b"\x1b]11;?\x07").unwrap();
+        host.respond(b"\x1b]4;0;?\x07").unwrap();
+        host.respond(b"\x1b_Gi=31337,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\")
+            .unwrap();
 
         let output = String::from_utf8(result.lock().unwrap().clone()).unwrap();
         assert!(output.contains("\x1b[4;480;900t"));
+        assert!(output.contains("\x1b]4;0;rgb:0000/0000/0000\x1b\\"));
+        assert!(output.contains("\x1b_Gi=31337;OK\x1b\\"));
     }
 }

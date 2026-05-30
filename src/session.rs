@@ -288,6 +288,9 @@ mod implementation {
             state.consume()?;
             match listener.accept() {
                 Ok((mut stream, _)) => {
+                    stream
+                        .set_nonblocking(false)
+                        .context("set session connection blocking")?;
                     let request =
                         serde_json::from_reader(&mut stream).context("parse session request")?;
                     let close = matches!(request, Request::Close);
