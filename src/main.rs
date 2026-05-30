@@ -1,0 +1,329 @@
+mod capture;
+mod frame;
+mod render;
+
+use std::fs;
+use std::io::{self, Read};
+use std::path::PathBuf;
+use std::time::Duration;
+
+use anyhow::{Context, Result, bail};
+use clap::{Args, Parser, Subcommand, ValueEnum};
+
+const HELP: &str = "\
+cellshot is built for terminal UI inspection and agent workflows. It executes a command in a
+real pseudo-terminal or renders existing ANSI input, then writes inspectable artifacts from the
+visible terminal frame. Use the .txt output to inspect content, .png/.svg for visual review,
+.json for structured processing, and .ansi to replay or diagnose the original terminal stream.";
+
+const ROOT_EXAMPLES: &str = "\
+Examples:
+  cellshot capture --out captures/app -- my-terminal-app
+  cellshot capture --cols 100 --rows 32 --wait-for 'Commands' -s ctrl-p --out captures/menu -- my-terminal-app
+  printf '\\033[32msuccess\\033[0m\\n' | cellshot ansi --out captures/stdin
+
+Run `cellshot capture --help` for TUI-driving timing and interaction options.";
+
+const CAPTURE_HELP: &str = "\
+Capture flow:
+  1. Start COMMAND inside a PTY with TERM=xterm-truecolor.
+  2. Optionally wait for --initial-delay-ms and visible --wait-for text.
+  3. If --send input is queued, send the ordered events as one input burst.
+  4. Freeze the visible frame once PTY output is idle for --settle-ms or --deadline-ms expires.
+  5. Write OUT.svg, OUT.png, OUT.json, OUT.txt, and OUT.ansi.
+
+Use --wait-for whenever an interaction must occur only after a UI is mounted. If its text is not
+visible before the command exits or deadline expires, capture fails rather than exporting the
+wrong screen. Send keys by name and text as `text:<value>`, for example `-s ctrl-p text:model
+enter`. This release supports a single post-readiness input burst, not
+multi-step sessions.
+
+Use `--host opentui` only for OpenTUI applications, including OpenCode, that query terminal
+capabilities before painting their interface. Generic programs do not need a host profile.
+
+Examples:
+  cellshot capture --host opentui --cols 100 --rows 32 --out captures/home -- opencode
+  cellshot capture --host opentui --cols 100 --rows 32 --wait-for '/connect' -s ctrl-p text:model enter --out captures/model -- opencode
+  cellshot capture --wait-for 'Choose model' -s down enter --out captures/chosen -- my-tui
+  cellshot capture --cwd ./app --deadline-ms 8000 --out /tmp/app -- bun run dev";
+
+const ANSI_HELP: &str = "\
+ANSI mode does not launch a command. It parses input as a terminal stream at --cols by --rows
+and exports the final visible frame.
+
+Examples:
+  printf '\\033[44;97m status \\033[0m\\n' | cellshot ansi --out captures/status
+  cellshot ansi --cols 120 --rows 40 --input debug.ansi --out captures/replay";
+
+#[derive(Parser)]
+#[command(
+    name = "cellshot",
+    version,
+    about = "Capture styled terminal frames as SVG, PNG, JSON, and text",
+    long_about = HELP,
+    after_help = ROOT_EXAMPLES
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Run a terminal command under a PTY and capture its settled screen.
+    #[command(long_about = "Run a terminal command under a PTY and capture its settled visible screen.", after_help = CAPTURE_HELP)]
+    Capture(CaptureArgs),
+    /// Render ANSI/VT bytes from a file or stdin without spawning a process.
+    #[command(long_about = "Render ANSI/VT bytes from a file or stdin without spawning a process.", after_help = ANSI_HELP)]
+    Ansi(AnsiArgs),
+}
+
+#[derive(Args)]
+struct OutputArgs {
+    /// Terminal width in cells.
+    #[arg(long, default_value_t = 80)]
+    cols: u16,
+    /// Terminal height in cells.
+    #[arg(long, default_value_t = 24)]
+    rows: u16,
+    /// Cell width used for terminal geometry and rendering.
+    #[arg(long, default_value_t = 9)]
+    cell_width: u16,
+    /// Cell height used for terminal geometry and rendering.
+    #[arg(long, default_value_t = 18)]
+    cell_height: u16,
+    /// Outer padding around the rendered terminal in pixels.
+    #[arg(long, default_value_t = 18.0)]
+    padding: f32,
+    /// Font family used in SVG/PNG output.
+    #[arg(
+        long,
+        default_value = "JetBrains Mono, SFMono-Regular, Menlo, monospace"
+    )]
+    font_family: String,
+    /// Scale PNG output for sharp HiDPI viewing; SVG output is unchanged.
+    #[arg(long, default_value_t = 2.0)]
+    pixel_ratio: f32,
+    /// Output path stem; extensions are added automatically.
+    #[arg(short, long, default_value = "capture")]
+    out: PathBuf,
+    /// Hide the terminal cursor in rendered output.
+    #[arg(long)]
+    hide_cursor: bool,
+    /// Do not write the PNG artifact.
+    #[arg(long)]
+    no_png: bool,
+    /// Do not write the SVG artifact.
+    #[arg(long)]
+    no_svg: bool,
+}
+
+#[derive(Args)]
+struct CaptureArgs {
+    #[command(flatten)]
+    output: OutputArgs,
+    /// Capture after this many milliseconds without PTY output.
+    #[arg(long, default_value_t = 250)]
+    settle_ms: u64,
+    /// Capture and terminate after this deadline even if output continues.
+    #[arg(long, default_value_t = 5000)]
+    deadline_ms: u64,
+    /// Wait this long before allowing the initial screen to settle.
+    #[arg(long, default_value_t = 0)]
+    initial_delay_ms: u64,
+    /// Wait until the visible terminal includes this text before interacting or capturing.
+    #[arg(long)]
+    wait_for: Option<String>,
+    /// Fail if terminal output exceeds this many bytes.
+    #[arg(long, default_value_t = 16 * 1024 * 1024)]
+    max_bytes: usize,
+    /// Working directory for the terminal command.
+    #[arg(long)]
+    cwd: Option<PathBuf>,
+    /// Terminal-host compatibility response profile.
+    #[arg(long, value_enum)]
+    host: Option<HostProfile>,
+    /// Ordered input after readiness: key name or `text:<value>` (repeatable/groupable).
+    #[arg(short = 's', long, value_name = "INPUT", num_args = 1..)]
+    send: Vec<String>,
+    /// Command and arguments to launch, following `--`.
+    #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+    command: Vec<String>,
+}
+
+#[derive(Args)]
+struct AnsiArgs {
+    #[command(flatten)]
+    output: OutputArgs,
+    /// ANSI/VT input file; defaults to stdin.
+    #[arg(long)]
+    input: Option<PathBuf>,
+    /// Fail if ANSI input exceeds this many bytes.
+    #[arg(long, default_value_t = 16 * 1024 * 1024)]
+    max_bytes: usize,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum HostProfile {
+    /// Respond to OpenTUI startup terminal capability queries.
+    Opentui,
+}
+
+fn main() -> Result<()> {
+    match Cli::parse().command {
+        Command::Capture(args) => {
+            let options = capture::Options {
+                cols: args.output.cols,
+                rows: args.output.rows,
+                cell_width: args.output.cell_width,
+                cell_height: args.output.cell_height,
+                settle: Duration::from_millis(args.settle_ms),
+                deadline: Duration::from_millis(args.deadline_ms),
+                input: capture_input(&args.send)?,
+                initial_delay: Duration::from_millis(args.initial_delay_ms),
+                wait_for: args.wait_for,
+                max_bytes: args.max_bytes,
+                opentui_host: matches!(args.host, Some(HostProfile::Opentui)),
+            };
+            let captured = capture::command(&args.command, args.cwd.as_deref(), &options)?;
+            write_outputs(&captured, &args.output)?;
+        }
+        Command::Ansi(args) => {
+            let mut input = Vec::new();
+            let limit = args.max_bytes.saturating_add(1) as u64;
+            if let Some(path) = args.input.as_ref() {
+                fs::File::open(path)
+                    .with_context(|| format!("open {}", path.display()))?
+                    .take(limit)
+                    .read_to_end(&mut input)
+                    .with_context(|| format!("read {}", path.display()))?;
+            } else {
+                io::stdin()
+                    .take(limit)
+                    .read_to_end(&mut input)
+                    .context("read ANSI input")?;
+            }
+            if input.len() > args.max_bytes {
+                bail!("terminal input exceeds --max-bytes ({})", args.max_bytes);
+            }
+            let captured =
+                capture::ansi(input, args.output.rows, args.output.cols, args.max_bytes)?;
+            write_outputs(&captured, &args.output)?;
+        }
+    }
+    Ok(())
+}
+
+fn capture_input(events: &[String]) -> Result<Vec<u8>> {
+    let mut input = Vec::new();
+    for event in events {
+        if let Some(text) = event.strip_prefix("text:") {
+            input.extend_from_slice(text.as_bytes());
+            continue;
+        }
+        input.extend_from_slice(match event.as_str() {
+            "ctrl-p" => b"\x10",
+            "enter" => b"\r",
+            "escape" | "esc" => b"\x1b",
+            "up" => b"\x1b[A",
+            "down" => b"\x1b[B",
+            "left" => b"\x1b[D",
+            "right" => b"\x1b[C",
+            "tab" => b"\t",
+            _ => anyhow::bail!(
+                "unsupported --send event {event:?}; use text:<value>, ctrl-p, enter, escape, up, down, left, right, or tab"
+            ),
+        });
+    }
+    Ok(input)
+}
+
+fn write_outputs(captured: &capture::Captured, args: &OutputArgs) -> Result<()> {
+    if let Some(parent) = args
+        .out
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    let json_path = args.out.with_extension("json");
+    let text_path = args.out.with_extension("txt");
+    let ansi_path = args.out.with_extension("ansi");
+    fs::write(&json_path, serde_json::to_vec_pretty(&captured.frame)?)
+        .with_context(|| format!("write {}", json_path.display()))?;
+    fs::write(&text_path, captured.frame.text())
+        .with_context(|| format!("write {}", text_path.display()))?;
+    fs::write(&ansi_path, &captured.ansi)
+        .with_context(|| format!("write {}", ansi_path.display()))?;
+    let svg = (!args.no_svg || !args.no_png).then(|| {
+        render::svg(
+            &captured.frame,
+            &render::Options {
+                cell_width: f32::from(args.cell_width),
+                cell_height: f32::from(args.cell_height),
+                font_size: f32::from(args.cell_height) * 0.78,
+                padding: args.padding,
+                font_family: args.font_family.clone(),
+                show_cursor: !args.hide_cursor,
+            },
+        )
+    });
+    if let Some(svg) = svg.as_ref().filter(|_| !args.no_svg) {
+        let path = args.out.with_extension("svg");
+        fs::write(&path, svg).with_context(|| format!("write {}", path.display()))?;
+        println!("{}", path.display());
+    }
+    if let Some(svg) = svg.as_ref().filter(|_| !args.no_png) {
+        let path = args.out.with_extension("png");
+        render::png(svg, &path, args.pixel_ratio)?;
+        println!("{}", path.display());
+    }
+    println!("{}", json_path.display());
+    println!("{}", text_path.display());
+    println!("{}", ansi_path.display());
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preserves_ordered_input_events() {
+        assert_eq!(
+            capture_input(&[
+                "ctrl-p".to_owned(),
+                "text:model".to_owned(),
+                "enter".to_owned()
+            ])
+            .unwrap(),
+            b"\x10model\r"
+        );
+    }
+
+    #[test]
+    fn rejects_unsupported_input_events() {
+        assert!(capture_input(&["space".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn parses_compact_ordered_input_sequence() {
+        let cli = Cli::try_parse_from([
+            "cellshot",
+            "capture",
+            "--wait-for",
+            "ready",
+            "-s",
+            "ctrl-p",
+            "text:model",
+            "enter",
+            "--",
+            "app",
+        ])
+        .unwrap();
+        let Command::Capture(args) = cli.command else {
+            panic!("expected capture command");
+        };
+        assert_eq!(args.send, ["ctrl-p", "text:model", "enter"]);
+    }
+}

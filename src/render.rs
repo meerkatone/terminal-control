@@ -1,0 +1,276 @@
+use std::path::Path;
+
+use anyhow::{Context, Result};
+
+use crate::frame::{Cell, Frame, Underline};
+
+#[derive(Clone, Debug)]
+pub struct Options {
+    pub cell_width: f32,
+    pub cell_height: f32,
+    pub font_size: f32,
+    pub padding: f32,
+    pub font_family: String,
+    pub show_cursor: bool,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            cell_width: 9.0,
+            cell_height: 18.0,
+            font_size: 14.0,
+            padding: 18.0,
+            font_family: "JetBrains Mono, SFMono-Regular, Menlo, monospace".to_owned(),
+            show_cursor: true,
+        }
+    }
+}
+
+pub fn svg(frame: &Frame, options: &Options) -> String {
+    let width = f32::from(frame.cols) * options.cell_width + options.padding * 2.0;
+    let height = f32::from(frame.rows) * options.cell_height + options.padding * 2.0;
+    let mut output = format!(
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}"><rect width="100%" height="100%" rx="10" fill="{}"/><g font-family="{}" font-size="{}" xml:space="preserve">"#,
+        frame.background.css(),
+        xml(&options.font_family),
+        options.font_size,
+    );
+    for cell in &frame.cells {
+        if cell.background != frame.background {
+            output.push_str(&format!(
+                r#"<rect x="{}" y="{}" width="{}" height="{}" fill="{}"/>"#,
+                options.padding + f32::from(cell.x) * options.cell_width,
+                options.padding + f32::from(cell.y) * options.cell_height,
+                f32::from(cell.width) * options.cell_width,
+                options.cell_height,
+                cell.background.css(),
+            ));
+        }
+    }
+    for cell in &frame.cells {
+        if !cell.text.is_empty() && !cell.attributes.invisible {
+            output.push_str(&graphic(cell, options).unwrap_or_else(|| text(cell, options)));
+        }
+    }
+    if options.show_cursor
+        && let Some(cursor) = &frame.cursor
+    {
+        let x = options.padding + f32::from(cursor.x) * options.cell_width;
+        let y = options.padding + f32::from(cursor.y) * options.cell_height;
+        output.push_str(&format!(
+            r#"<rect x="{x}" y="{y}" width="{}" height="{}" fill="{}" opacity="0.32"/>"#,
+            options.cell_width,
+            options.cell_height,
+            cursor.color.css(),
+        ));
+    }
+    output.push_str("</g></svg>");
+    output
+}
+
+pub fn png(svg: &str, path: &Path, pixel_ratio: f32) -> Result<()> {
+    let mut options = resvg::usvg::Options::default();
+    options.fontdb_mut().load_system_fonts();
+    let tree =
+        resvg::usvg::Tree::from_data(svg.as_bytes(), &options).context("parse rendered SVG")?;
+    let size = tree.size().to_int_size();
+    let width = ((size.width() as f32) * pixel_ratio).ceil() as u32;
+    let height = ((size.height() as f32) * pixel_ratio).ceil() as u32;
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height).context("allocate PNG canvas")?;
+    resvg::render(
+        &tree,
+        resvg::tiny_skia::Transform::from_scale(pixel_ratio, pixel_ratio),
+        &mut pixmap.as_mut(),
+    );
+    pixmap.save_png(path).context("write PNG artifact")?;
+    Ok(())
+}
+
+fn graphic(cell: &Cell, options: &Options) -> Option<String> {
+    let mut chars = cell.text.chars();
+    let char = chars.next()?;
+    if chars.next().is_some() {
+        return None;
+    }
+    let x = options.padding + f32::from(cell.x) * options.cell_width;
+    let y = options.padding + f32::from(cell.y) * options.cell_height;
+    let width = options.cell_width * f32::from(cell.width);
+    let height = options.cell_height;
+    let rect = |x: f32, y: f32, width: f32, height: f32, opacity: Option<f32>| {
+        format!(
+            r#"<rect x="{x}" y="{y}" width="{width}" height="{height}" fill="{}"{}/>"#,
+            cell.foreground.css(),
+            opacity.map_or_else(String::new, |value| format!(r#" opacity="{value}""#)),
+        )
+    };
+    let single = |left: f32, top: f32, wide: f32, tall: f32| {
+        rect(
+            x + width * left,
+            y + height * top,
+            width * wide,
+            height * tall,
+            None,
+        )
+    };
+    Some(match char {
+        '█' => single(0.0, 0.0, 1.0, 1.0),
+        '▀' => single(0.0, 0.0, 1.0, 0.5),
+        '▄' => single(0.0, 0.5, 1.0, 0.5),
+        '▌' => single(0.0, 0.0, 0.5, 1.0),
+        '▐' => single(0.5, 0.0, 0.5, 1.0),
+        '▁' => single(0.0, 7.0 / 8.0, 1.0, 1.0 / 8.0),
+        '▂' => single(0.0, 6.0 / 8.0, 1.0, 2.0 / 8.0),
+        '▃' => single(0.0, 5.0 / 8.0, 1.0, 3.0 / 8.0),
+        '▅' => single(0.0, 3.0 / 8.0, 1.0, 5.0 / 8.0),
+        '▆' => single(0.0, 2.0 / 8.0, 1.0, 6.0 / 8.0),
+        '▇' => single(0.0, 1.0 / 8.0, 1.0, 7.0 / 8.0),
+        '▏' => single(0.0, 0.0, 1.0 / 8.0, 1.0),
+        '▎' => single(0.0, 0.0, 2.0 / 8.0, 1.0),
+        '▍' => single(0.0, 0.0, 3.0 / 8.0, 1.0),
+        '▋' => single(0.0, 0.0, 5.0 / 8.0, 1.0),
+        '▊' => single(0.0, 0.0, 6.0 / 8.0, 1.0),
+        '▉' => single(0.0, 0.0, 7.0 / 8.0, 1.0),
+        '▔' => single(0.0, 0.0, 1.0, 1.0 / 8.0),
+        '▖' => single(0.0, 0.5, 0.5, 0.5),
+        '▗' => single(0.5, 0.5, 0.5, 0.5),
+        '▘' => single(0.0, 0.0, 0.5, 0.5),
+        '▝' => single(0.5, 0.0, 0.5, 0.5),
+        '▚' => single(0.0, 0.0, 0.5, 0.5) + &single(0.5, 0.5, 0.5, 0.5),
+        '▞' => single(0.5, 0.0, 0.5, 0.5) + &single(0.0, 0.5, 0.5, 0.5),
+        '▙' => single(0.0, 0.0, 0.5, 1.0) + &single(0.5, 0.5, 0.5, 0.5),
+        '▛' => single(0.0, 0.0, 0.5, 1.0) + &single(0.5, 0.0, 0.5, 0.5),
+        '▜' => single(0.5, 0.0, 0.5, 1.0) + &single(0.0, 0.0, 0.5, 0.5),
+        '▟' => single(0.5, 0.0, 0.5, 1.0) + &single(0.0, 0.5, 0.5, 0.5),
+        '░' => rect(x, y, width, height, Some(0.25)),
+        '▒' => rect(x, y, width, height, Some(0.5)),
+        '▓' => rect(x, y, width, height, Some(0.75)),
+        _ => return None,
+    })
+}
+
+fn text(cell: &Cell, options: &Options) -> String {
+    let x = options.padding + f32::from(cell.x) * options.cell_width;
+    let y = options.padding + f32::from(cell.y) * options.cell_height + options.cell_height * 0.78;
+    let decorations = [
+        cell.attributes
+            .underline
+            .map(|Underline::Single| "underline"),
+        cell.attributes.strikethrough.then_some("line-through"),
+        cell.attributes.overline.then_some("overline"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" ");
+    format!(
+        r#"<text x="{x}" y="{y}" fill="{}"{}{}{}{}>{}</text>"#,
+        cell.foreground.css(),
+        if cell.attributes.bold {
+            " font-weight=\"700\""
+        } else {
+            ""
+        },
+        if cell.attributes.italic {
+            " font-style=\"italic\""
+        } else {
+            ""
+        },
+        if cell.attributes.faint {
+            " opacity=\"0.55\""
+        } else {
+            ""
+        },
+        if decorations.is_empty() {
+            String::new()
+        } else {
+            format!(" text-decoration=\"{decorations}\"")
+        },
+        xml(&cell.text),
+    )
+}
+
+fn xml(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::frame::{Attributes, Color, Frame, Underline};
+
+    #[test]
+    fn emits_background_and_text_styles_in_svg() {
+        let frame = Frame {
+            version: 1,
+            cols: 4,
+            rows: 1,
+            foreground: Color {
+                r: 255,
+                g: 255,
+                b: 255,
+            },
+            background: Color { r: 0, g: 0, b: 0 },
+            cursor: None,
+            cells: vec![crate::frame::Cell {
+                x: 0,
+                y: 0,
+                text: "Hi".to_owned(),
+                width: 2,
+                foreground: Color { r: 1, g: 2, b: 3 },
+                background: Color { r: 4, g: 5, b: 6 },
+                attributes: Attributes {
+                    bold: true,
+                    underline: Some(Underline::Single),
+                    ..Attributes::default()
+                },
+            }],
+        };
+
+        let output = svg(&frame, &Options::default());
+
+        assert!(output.contains("#040506"));
+        assert!(output.contains("#010203"));
+        assert!(output.contains("font-weight=\"700\""));
+        assert!(output.contains("text-decoration=\"underline\""));
+    }
+
+    #[test]
+    fn renders_block_elements_as_geometry_instead_of_font_glyphs() {
+        let frame = Frame {
+            version: 1,
+            cols: 1,
+            rows: 1,
+            foreground: Color {
+                r: 255,
+                g: 255,
+                b: 255,
+            },
+            background: Color { r: 0, g: 0, b: 0 },
+            cursor: None,
+            cells: vec![crate::frame::Cell {
+                x: 0,
+                y: 0,
+                text: "▀".to_owned(),
+                width: 1,
+                foreground: Color {
+                    r: 255,
+                    g: 255,
+                    b: 255,
+                },
+                background: Color { r: 0, g: 0, b: 0 },
+                attributes: Attributes::default(),
+            }],
+        };
+
+        let output = svg(&frame, &Options::default());
+
+        assert!(output.contains("height=\"9\""));
+        assert!(!output.contains(">▀</text>"));
+    }
+}

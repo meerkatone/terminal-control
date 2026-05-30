@@ -1,0 +1,25 @@
+[package]
+name = "cellshot"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.93"
+description = "Capture terminal applications as styled, reviewable visual artifacts"
+license = "MIT"
+repository = "https://github.com/kitlangton/cellshot"
+readme = "README.md"
+keywords = ["terminal", "tui", "screenshot", "automation", "ansi"]
+categories = ["command-line-utilities", "development-tools::testing"]
+publish = false
+include = ["/src/**", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE"]
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+portable-pty = "0.9.0"
+resvg = { version = "0.47.0", default-features = false, features = ["text", "system-fonts", "memmap-fonts"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+vt100 = "0.16.2"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
