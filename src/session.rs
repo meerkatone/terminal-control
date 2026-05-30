@@ -5,7 +5,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
+use portable_pty::{Child, CommandBuilder, ExitStatus, MasterPty, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
 use vt100::Parser;
 
@@ -36,7 +36,9 @@ pub struct Session {
     host: Host,
     receive: Receiver<Option<Output>>,
     max_bytes: usize,
-    closed: bool,
+    output_closed: bool,
+    stopped: bool,
+    exit: Option<ProcessExit>,
     last_output: Option<Instant>,
     recording: Option<recording::Writer>,
     cols: u16,
@@ -53,10 +55,46 @@ pub enum SessionState {
     Exited,
 }
 
+/// Termination information observed for a completed terminal application.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ProcessExit {
+    pub code: u32,
+    pub signal: Option<String>,
+    pub success: bool,
+}
+
+impl From<ExitStatus> for ProcessExit {
+    fn from(status: ExitStatus) -> Self {
+        Self {
+            code: status.exit_code(),
+            signal: status.signal().map(str::to_owned),
+            success: status.success(),
+        }
+    }
+}
+
+/// Reason a session capture returned its visible shot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CaptureReason {
+    Idle,
+    Deadline,
+    Exited,
+    OutputClosed,
+}
+
+/// A visible shot together with the condition that made it observable.
+#[derive(Deserialize, Serialize)]
+pub struct CaptureResult {
+    pub shot: Shot,
+    pub reason: CaptureReason,
+}
+
 /// Observable state of one embedded or named terminal session.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SessionStatus {
     pub state: SessionState,
+    pub exit: Option<ProcessExit>,
     pub cols: u16,
     pub rows: u16,
     pub cell_width: u16,
@@ -162,7 +200,8 @@ impl Session {
             host: Host::new(writer, options),
             receive,
             max_bytes: options.max_bytes,
-            closed: false,
+            output_closed: false,
+            stopped: false,
             last_output: None,
             recording,
             cols: options.cols,
@@ -180,7 +219,7 @@ impl Session {
     /// Send ordered input bursts, optionally pacing them for recorded interactions.
     pub fn send_all(&mut self, input: &[Vec<u8>], pace: Duration) -> Result<()> {
         self.consume()?;
-        if self.closed {
+        if self.has_exited()? || self.stopped {
             bail!("session command has exited");
         }
         let last = input.len().saturating_sub(1);
@@ -205,7 +244,7 @@ impl Session {
             if self.parser.screen().contents().contains(text) {
                 return Ok(());
             }
-            if self.closed {
+            if self.has_exited()? || self.stopped {
                 bail!("session ended before visible terminal included {text:?}");
             }
             if Instant::now() >= deadline {
@@ -221,7 +260,7 @@ impl Session {
         let deadline = started + timeout;
         loop {
             self.consume()?;
-            if self.closed || self.last_output.unwrap_or(started).elapsed() >= settle {
+            if self.output_closed || self.last_output.unwrap_or(started).elapsed() >= settle {
                 return Ok(());
             }
             if Instant::now() >= deadline {
@@ -237,7 +276,7 @@ impl Session {
         let deadline = started + deadline;
         loop {
             self.consume()?;
-            if self.closed
+            if self.output_closed
                 || self.last_output.unwrap_or(started).elapsed() >= settle
                 || Instant::now() >= deadline
             {
@@ -254,7 +293,7 @@ impl Session {
     pub fn status(&mut self) -> Result<SessionStatus> {
         self.consume()?;
         Ok(SessionStatus {
-            state: if self.closed {
+            state: if self.has_exited()? || self.stopped {
                 SessionState::Exited
             } else {
                 SessionState::Running
@@ -341,34 +380,54 @@ impl Session {
     }
 
     fn consume(&mut self) -> Result<()> {
+        while self.consume_one()? {}
+        Ok(())
+    }
+
+    fn consume_batch(&mut self) -> Result<()> {
         for _ in 0..OUTPUT_BATCH {
-            match self.receive.try_recv() {
-                Ok(Some(output)) => {
-                    if let Some(recording) = &mut self.recording {
-                        recording.output(output.at_ms, &output.bytes)?;
-                    }
-                    let response = self.host.respond(&output.bytes)?;
-                    if !response.is_empty()
-                        && let Some(recording) = &mut self.recording
-                    {
-                        recording.input(InputOrigin::Host, &response)?;
-                    }
-                    shot::retain(&mut self.ansi, &output.bytes, self.max_bytes)?;
-                    self.parser.process(&output.bytes);
-                    self.last_output = Some(Instant::now());
-                }
-                Ok(None) | Err(TryRecvError::Disconnected) => {
-                    self.closed = true;
-                    return Ok(());
-                }
-                Err(TryRecvError::Empty) => return Ok(()),
+            if !self.consume_one()? {
+                break;
             }
         }
         Ok(())
     }
 
+    fn consume_one(&mut self) -> Result<bool> {
+        match self.receive.try_recv() {
+            Ok(Some(output)) => {
+                if let Some(recording) = &mut self.recording {
+                    recording.output(output.at_ms, &output.bytes)?;
+                }
+                let response = self.host.respond(&output.bytes)?;
+                if !response.is_empty()
+                    && let Some(recording) = &mut self.recording
+                {
+                    recording.input(InputOrigin::Host, &response)?;
+                }
+                shot::retain(&mut self.ansi, &output.bytes, self.max_bytes)?;
+                self.parser.process(&output.bytes);
+                self.last_output = Some(Instant::now());
+                Ok(true)
+            }
+            Ok(None) | Err(TryRecvError::Disconnected) => {
+                self.output_closed = true;
+                Ok(false)
+            }
+            Err(TryRecvError::Empty) => Ok(false),
+        }
+    }
+
+    fn has_exited(&mut self) -> Result<bool> {
+        Ok(self
+            .child
+            .try_wait()
+            .context("poll session command")?
+            .is_some())
+    }
+
     fn terminate(&mut self) {
-        if self.closed {
+        if self.stopped {
             return;
         }
         #[cfg(unix)]
@@ -378,7 +437,9 @@ impl Session {
             }
         }
         let _ = self.child.kill();
-        self.closed = true;
+        let _ = self.child.wait();
+        self.output_closed = true;
+        self.stopped = true;
     }
 }
 
@@ -799,7 +860,7 @@ mod implementation {
     fn run(listener: &UnixListener, session: &mut Session) -> Result<()> {
         loop {
             // Keep parsing and recording output even when no control request is in flight.
-            session.consume()?;
+            session.consume_batch()?;
             match listener.accept() {
                 Ok((stream, _)) => {
                     if handle(stream, session)? {
@@ -1061,5 +1122,39 @@ mod tests {
                 .any(|bytes| bytes == b"one")
         );
         session.stop().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stopping_after_pty_eof_terminates_still_running_process() {
+        let pid_path = std::env::temp_dir().join(format!(
+            "cellshot-pty-eof-owner-test-{}.pid",
+            std::process::id()
+        ));
+        let script = format!(
+            "printf '%s' $$ > '{}'; exec >/dev/null 2>&1; sleep 30",
+            pid_path.display()
+        );
+        let mut session = Session::start(
+            &["sh".to_owned(), "-c".to_owned(), script],
+            None,
+            None,
+            &Options::default(),
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let pid = loop {
+            if let Ok(pid) = std::fs::read_to_string(&pid_path) {
+                break pid.parse::<i32>().unwrap();
+            }
+            assert!(Instant::now() < deadline, "child did not write its pid");
+            thread::sleep(Duration::from_millis(10));
+        };
+        thread::sleep(Duration::from_millis(20));
+
+        assert_eq!(session.status().unwrap().state, SessionState::Running);
+        session.stop().unwrap();
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        let _ = std::fs::remove_file(pid_path);
     }
 }

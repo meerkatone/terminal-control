@@ -847,19 +847,8 @@ fn write_outputs(captured: &shot_engine::Shot, args: &RenderArgs) -> Result<()> 
         fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
     let enabled = |format| args.formats.is_empty() || args.formats.contains(&format);
-    let svg = (enabled(ShotFormat::Svg) || enabled(ShotFormat::Png)).then(|| {
-        render::svg(
-            &captured.frame,
-            &render::Options {
-                cell_width: f32::from(args.cell_width),
-                cell_height: f32::from(args.cell_height),
-                font_size: f32::from(args.cell_height) * 0.78,
-                padding: args.padding,
-                font_family: args.font_family.clone(),
-                show_cursor: !args.hide_cursor,
-            },
-        )
-    });
+    let svg = (enabled(ShotFormat::Svg) || enabled(ShotFormat::Png))
+        .then(|| rendered_svg(captured, args));
     if let Some(svg) = svg.as_ref().filter(|_| enabled(ShotFormat::Svg)) {
         let path = args.out.with_extension("svg");
         fs::write(&path, svg).with_context(|| format!("write {}", path.display()))?;
@@ -896,18 +885,7 @@ fn write_stdout(captured: &shot_engine::Shot, args: &RenderArgs) -> Result<()> {
         ShotFormat::Txt => captured.frame.text().into_bytes(),
         ShotFormat::Json => serde_json::to_vec_pretty(&captured.frame)?,
         ShotFormat::Ansi => captured.ansi.clone(),
-        ShotFormat::Svg => render::svg(
-            &captured.frame,
-            &render::Options {
-                cell_width: f32::from(args.cell_width),
-                cell_height: f32::from(args.cell_height),
-                font_size: f32::from(args.cell_height) * 0.78,
-                padding: args.padding,
-                font_family: args.font_family.clone(),
-                show_cursor: !args.hide_cursor,
-            },
-        )
-        .into_bytes(),
+        ShotFormat::Svg => rendered_svg(captured, args).into_bytes(),
         ShotFormat::Png => unreachable!("stdout format validated before observation"),
     };
     io::stdout()
@@ -919,6 +897,20 @@ fn write_stdout(captured: &shot_engine::Shot, args: &RenderArgs) -> Result<()> {
             .context("write shot output newline")?;
     }
     Ok(())
+}
+
+fn rendered_svg(captured: &shot_engine::Shot, args: &RenderArgs) -> String {
+    render::svg(
+        &captured.frame,
+        &render::Options {
+            cell_width: f32::from(args.cell_width),
+            cell_height: f32::from(args.cell_height),
+            font_size: f32::from(args.cell_height) * 0.78,
+            padding: args.padding,
+            font_family: args.font_family.clone(),
+            show_cursor: !args.hide_cursor,
+        },
+    )
 }
 
 fn stdout_format(args: &RenderArgs) -> Result<ShotFormat> {
