@@ -13,7 +13,9 @@ use crate::frame::from_screen;
 use crate::recording::{self, InputOrigin};
 use crate::shot::{self, Host, Options, Shot};
 
-const OUTPUT_BATCH: usize = 32;
+const OUTPUT_BATCH: usize = 1;
+const OUTPUT_QUEUE: usize = 4;
+const OUTPUT_CHUNK: usize = 1024;
 const SCROLLBACK_ROWS: usize = 10_000;
 
 struct Output {
@@ -36,6 +38,7 @@ pub struct Session {
     host: Host,
     receive: Receiver<Option<Output>>,
     max_bytes: usize,
+    ansi_truncated: bool,
     output_closed: bool,
     stopped: bool,
     exit: Option<ProcessExit>,
@@ -102,6 +105,7 @@ pub struct SessionStatus {
     pub idle_for_ms: Option<u64>,
     pub has_visible_content: bool,
     pub recording: bool,
+    pub history_truncated: bool,
 }
 
 /// One named daemon session discovered in the local runtime directory.
@@ -149,7 +153,7 @@ impl Session {
             .context("open session pseudo-terminal")?;
         let mut builder = CommandBuilder::new(&command[0]);
         builder.args(&command[1..]);
-        shot::configure_pty_environment(&mut builder, options.color);
+        shot::configure_pty_environment(&mut builder, options);
         if let Some(cwd) = cwd {
             builder.cwd(cwd);
         }
@@ -168,9 +172,9 @@ impl Session {
         drop(pair.slave);
         #[cfg(unix)]
         let process_group = child.process_id().and_then(|pid| i32::try_from(pid).ok());
-        let (send, receive) = mpsc::sync_channel(32);
+        let (send, receive) = mpsc::sync_channel(OUTPUT_QUEUE);
         thread::spawn(move || {
-            let mut buffer = [0_u8; 16 * 1024];
+            let mut buffer = [0_u8; OUTPUT_CHUNK];
             loop {
                 match reader.read(&mut buffer) {
                     Ok(0) => break,
@@ -200,6 +204,7 @@ impl Session {
             host: Host::new(writer, options),
             receive,
             max_bytes: options.max_bytes,
+            ansi_truncated: false,
             output_closed: false,
             stopped: false,
             exit: None,
@@ -219,7 +224,7 @@ impl Session {
 
     /// Send ordered input bursts, optionally pacing them for recorded interactions.
     pub fn send_all(&mut self, input: &[Vec<u8>], pace: Duration) -> Result<()> {
-        self.consume()?;
+        self.consume_batch()?;
         if self.has_exited()? || self.stopped {
             bail!("session command has exited");
         }
@@ -231,7 +236,7 @@ impl Session {
             }
             if !pace.is_zero() && index < last {
                 thread::sleep(pace);
-                self.consume()?;
+                self.consume_batch()?;
             }
         }
         Ok(())
@@ -241,7 +246,7 @@ impl Session {
     pub fn wait_for_text(&mut self, text: &str, timeout: Duration) -> Result<()> {
         let deadline = Instant::now() + timeout;
         loop {
-            self.consume()?;
+            self.consume_batch()?;
             if self.parser.screen().contents().contains(text) {
                 return Ok(());
             }
@@ -260,7 +265,7 @@ impl Session {
         let started = Instant::now();
         let deadline = started + timeout;
         loop {
-            self.consume()?;
+            self.consume_batch()?;
             if self.output_closed || self.last_output.unwrap_or(started).elapsed() >= settle {
                 return Ok(());
             }
@@ -271,12 +276,27 @@ impl Session {
         }
     }
 
+    /// Wait for the terminal application to exit, returning `None` on timeout.
+    pub fn wait_for_exit(&mut self, timeout: Duration) -> Result<Option<ProcessExit>> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            self.consume_batch()?;
+            if self.has_exited()? || self.stopped {
+                return Ok(self.exit.clone());
+            }
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     /// Capture visible terminal state and report whether it settled, exited, or reached a limit.
     pub fn capture(&mut self, settle: Duration, deadline: Duration) -> Result<CaptureResult> {
         let started = Instant::now();
         let deadline = started + deadline;
         loop {
-            self.consume()?;
+            self.consume_batch()?;
             let reason = if self.has_exited()? || self.stopped {
                 Some(CaptureReason::Exited)
             } else if self.output_closed {
@@ -308,7 +328,7 @@ impl Session {
 
     /// Inspect session lifecycle, geometry, and whether a visible frame is available.
     pub fn status(&mut self) -> Result<SessionStatus> {
-        self.consume()?;
+        self.consume_batch()?;
         Ok(SessionStatus {
             state: if self.has_exited()? || self.stopped {
                 SessionState::Exited
@@ -325,12 +345,13 @@ impl Session {
                 .map(|last| last.elapsed().as_millis() as u64),
             has_visible_content: from_screen(self.parser.screen()).has_visible_content(),
             recording: self.recording.is_some(),
+            history_truncated: self.ansi_truncated,
         })
     }
 
     /// Return readable normal-screen scrollback, or the exact retained ANSI/VT stream.
     pub fn history(&mut self, ansi: bool) -> Result<Vec<u8>> {
-        self.consume()?;
+        self.consume_batch()?;
         if ansi {
             return Ok(self.ansi.clone());
         }
@@ -369,10 +390,10 @@ impl Session {
         if cols == 0 || rows == 0 {
             bail!("terminal dimensions must be greater than zero");
         }
-        if self.recording.is_some() {
-            bail!("resizing recorded sessions is not yet supported");
+        if self.ansi_truncated {
+            bail!("resizing sessions after retained output is truncated is not yet supported");
         }
-        self.consume()?;
+        self.consume_batch()?;
         self.master
             .resize(PtySize {
                 rows,
@@ -388,6 +409,9 @@ impl Session {
         self.rows = rows;
         self.cell_width = cell_width;
         self.cell_height = cell_height;
+        if let Some(recording) = &mut self.recording {
+            recording.resize(cols, rows, cell_width, cell_height)?;
+        }
         Ok(())
     }
 
@@ -397,9 +421,8 @@ impl Session {
         Ok(())
     }
 
-    fn consume(&mut self) -> Result<()> {
-        while self.consume_one()? {}
-        Ok(())
+    pub(crate) fn pump(&mut self) -> Result<()> {
+        self.consume_batch()
     }
 
     fn consume_batch(&mut self) -> Result<()> {
@@ -414,18 +437,7 @@ impl Session {
     fn consume_one(&mut self) -> Result<bool> {
         match self.receive.try_recv() {
             Ok(Some(output)) => {
-                if let Some(recording) = &mut self.recording {
-                    recording.output(output.at_ms, &output.bytes)?;
-                }
-                let response = self.host.respond(&output.bytes)?;
-                if !response.is_empty()
-                    && let Some(recording) = &mut self.recording
-                {
-                    recording.input(InputOrigin::Host, &response)?;
-                }
-                shot::retain(&mut self.ansi, &output.bytes, self.max_bytes)?;
-                self.parser.process(&output.bytes);
-                self.last_output = Some(Instant::now());
+                self.apply_output(output)?;
                 Ok(true)
             }
             Ok(None) | Err(TryRecvError::Disconnected) => {
@@ -442,6 +454,7 @@ impl Session {
         }
         if let Some(status) = self.child.try_wait().context("poll session command")? {
             self.exit = Some(status.into());
+            self.finish_exited_output()?;
             return Ok(true);
         }
         Ok(false)
@@ -458,14 +471,93 @@ impl Session {
             }
         }
         let _ = self.child.kill();
-        if self.exit.is_none()
-            && let Ok(status) = self.child.wait()
-        {
-            self.exit = Some(status.into());
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while self.exit.is_none() && Instant::now() < deadline {
+            // The PTY reader may be blocked by the bounded queue while the child exits.
+            // Keep draining one chunk at a time so forced shutdown cannot deadlock on backpressure.
+            let _ = self.consume_one();
+            if let Ok(Some(status)) = self.child.try_wait() {
+                self.exit = Some(status.into());
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
         }
         self.output_closed = true;
         self.stopped = true;
     }
+
+    fn finish_exited_output(&mut self) -> Result<()> {
+        let kill_after = Instant::now() + Duration::from_millis(50);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !self.output_closed && Instant::now() < deadline {
+            // A cleanly exited application should close the PTY promptly. Only signal its
+            // saved group if output remains open long enough to indicate a live descendant.
+            #[cfg(unix)]
+            if Instant::now() >= kill_after
+                && let Some(process_group) = self.process_group.take()
+            {
+                unsafe {
+                    libc::kill(-process_group, libc::SIGKILL);
+                }
+            }
+            match self.receive.recv_timeout(Duration::from_millis(10)) {
+                Ok(Some(output)) => self.apply_output(output)?,
+                Ok(None) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    self.output_closed = true;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            }
+        }
+        #[cfg(unix)]
+        if self.output_closed {
+            self.process_group.take();
+        }
+        Ok(())
+    }
+
+    fn apply_output(&mut self, output: Output) -> Result<()> {
+        if let Some(recording) = &mut self.recording {
+            recording.output(output.at_ms, &output.bytes)?;
+        }
+        let response = self.host.respond(&output.bytes)?;
+        if !response.is_empty()
+            && let Some(recording) = &mut self.recording
+        {
+            recording.input(InputOrigin::Host, &response)?;
+        }
+        retain_recent(
+            &mut self.ansi,
+            &output.bytes,
+            self.max_bytes,
+            &mut self.ansi_truncated,
+        );
+        self.parser.process(&output.bytes);
+        self.last_output = Some(Instant::now());
+        Ok(())
+    }
+}
+
+fn retain_recent(ansi: &mut Vec<u8>, bytes: &[u8], max_bytes: usize, truncated: &mut bool) {
+    if max_bytes == 0 {
+        *truncated |= !bytes.is_empty();
+        ansi.clear();
+        return;
+    }
+    if bytes.len() >= max_bytes {
+        *truncated |= !ansi.is_empty() || bytes.len() > max_bytes;
+        ansi.clear();
+        ansi.extend_from_slice(&bytes[bytes.len() - max_bytes..]);
+        return;
+    }
+    let excess = ansi
+        .len()
+        .saturating_add(bytes.len())
+        .saturating_sub(max_bytes);
+    if excess > 0 {
+        ansi.drain(..excess);
+        *truncated = true;
+    }
+    ansi.extend_from_slice(bytes);
 }
 
 fn session_terminal(rows: u16, cols: u16) -> Parser {
@@ -534,16 +626,8 @@ pub fn restart(
     record: Option<&Path>,
     options: &Options,
 ) -> Result<()> {
-    if request(name, Request::Stop).is_ok() {
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while request(name, Request::Ping).is_ok() {
-            if Instant::now() >= deadline {
-                bail!("timed out stopping session {name:?} before restart");
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
-    }
-    start(name, command, cwd, record, options)
+    validate_name(name)?;
+    implementation::restart(name, command, cwd, record, options)
 }
 
 #[doc(hidden)]
@@ -666,7 +750,9 @@ fn socket_path(name: &str) -> Result<PathBuf> {
 #[cfg(unix)]
 mod implementation {
     use std::fs;
+    use std::fs::OpenOptions;
     use std::io::{ErrorKind, Read, Write};
+    use std::os::fd::AsRawFd;
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
@@ -681,6 +767,32 @@ mod implementation {
 
     const MAX_REQUEST_BYTES: u64 = 1024 * 1024;
     const CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
+
+    struct StartLock(fs::File);
+
+    impl StartLock {
+        fn acquire(path: &Path) -> Result<Self> {
+            let file = OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(path)
+                .with_context(|| format!("open {}", path.display()))?;
+            let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if result != 0 {
+                bail!("another session operation is already starting this name");
+            }
+            Ok(Self(file))
+        }
+    }
+
+    impl Drop for StartLock {
+        fn drop(&mut self) {
+            unsafe {
+                libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
+            }
+        }
+    }
     pub fn runtime_dir() -> Result<PathBuf> {
         let path = std::env::var_os("CELLSHOT_RUNTIME_DIR")
             .map(PathBuf::from)
@@ -728,8 +840,50 @@ mod implementation {
         if command.is_empty() {
             bail!("provide a command after --");
         }
-        let socket = runtime_dir()?.join(format!("{name}.sock"));
-        ensure_socket_path(&socket)?;
+        let runtime = runtime_dir()?;
+        ensure_socket_path(&runtime.join(format!("{name}.sock")))?;
+        let _lock = StartLock::acquire(&runtime.join(format!("{name}.lock")))?;
+        start_locked(name, command, cwd, record, options, &runtime)
+    }
+
+    pub fn restart(
+        name: &str,
+        command: &[String],
+        cwd: Option<&Path>,
+        record: Option<&Path>,
+        options: &Options,
+    ) -> Result<()> {
+        if command.is_empty() {
+            bail!("provide a command after --");
+        }
+        let runtime = runtime_dir()?;
+        ensure_socket_path(&runtime.join(format!("{name}.sock")))?;
+        let _lock = StartLock::acquire(&runtime.join(format!("{name}.lock")))?;
+        let socket = runtime.join(format!("{name}.sock"));
+        if let Ok(response) = request(socket.clone(), &Request::Stop) {
+            if let Some(error) = response.error {
+                bail!(error);
+            }
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while request(socket.clone(), &Request::Ping).is_ok() {
+                if Instant::now() >= deadline {
+                    bail!("timed out stopping session {name:?} before restart");
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+        start_locked(name, command, cwd, record, options, &runtime)
+    }
+
+    fn start_locked(
+        name: &str,
+        command: &[String],
+        cwd: Option<&Path>,
+        record: Option<&Path>,
+        options: &Options,
+        runtime: &Path,
+    ) -> Result<()> {
+        let socket = runtime.join(format!("{name}.sock"));
         if socket.exists() {
             if request(socket.clone(), &Request::Ping).is_ok() {
                 bail!("session {name:?} is already running");
@@ -858,16 +1012,20 @@ mod implementation {
         if command.is_empty() {
             bail!("provide a command after --");
         }
-        let listener =
-            UnixListener::bind(&socket).with_context(|| format!("bind {}", socket.display()))?;
-        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("secure {}", socket.display()))?;
-        listener
-            .set_nonblocking(true)
-            .context("set session socket nonblocking")?;
-        let mut session = Session::start(&command, cwd.as_deref(), record.as_deref(), &options)?;
-        let result = run(&listener, &mut session);
-        let _ = session.stop();
+        let result = (|| {
+            let listener = UnixListener::bind(&socket)
+                .with_context(|| format!("bind {}", socket.display()))?;
+            fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("secure {}", socket.display()))?;
+            listener
+                .set_nonblocking(true)
+                .context("set session socket nonblocking")?;
+            let mut session =
+                Session::start(&command, cwd.as_deref(), record.as_deref(), &options)?;
+            let result = run(&listener, &mut session);
+            let _ = session.stop();
+            result
+        })();
         let _ = fs::remove_file(&socket);
         result
     }
@@ -1005,6 +1163,25 @@ mod implementation {
         }
         Ok(response)
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn name_start_lock_rejects_a_concurrent_owner() {
+            let path = std::env::temp_dir().join(format!(
+                "cellshot-start-lock-test-{}.lock",
+                std::process::id()
+            ));
+            let held = StartLock::acquire(&path).unwrap();
+
+            assert!(StartLock::acquire(&path).is_err());
+            drop(held);
+            assert!(StartLock::acquire(&path).is_ok());
+            let _ = fs::remove_file(path);
+        }
+    }
 }
 
 #[cfg(not(unix))]
@@ -1017,6 +1194,15 @@ mod implementation {
         bail!("persistent sessions require Unix sockets")
     }
     pub fn start(
+        _: &str,
+        _: &[String],
+        _: Option<&Path>,
+        _: Option<&Path>,
+        _: &Options,
+    ) -> Result<()> {
+        bail!("persistent sessions require Unix sockets")
+    }
+    pub fn restart(
         _: &str,
         _: &[String],
         _: Option<&Path>,
@@ -1098,7 +1284,8 @@ mod tests {
             &[
                 "sh".to_owned(),
                 "-c".to_owned(),
-                "while :; do printf x; sleep 0.01; done".to_owned(),
+                "while :; do printf xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx; sleep 0.001; done"
+                    .to_owned(),
             ],
             None,
             None,
@@ -1111,6 +1298,32 @@ mod tests {
             .unwrap();
 
         assert_eq!(capture.reason, CaptureReason::Deadline);
+        session.stop().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_retains_recent_output_without_failing_after_limit() {
+        let mut session = Session::start(
+            &[
+                "sh".to_owned(),
+                "-c".to_owned(),
+                "printf '123456789'; sleep 1".to_owned(),
+            ],
+            None,
+            None,
+            &Options {
+                max_bytes: 4,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        session
+            .wait_for_text("123456789", Duration::from_secs(2))
+            .unwrap();
+
+        assert_eq!(session.history(true).unwrap(), b"6789");
+        assert!(session.status().unwrap().history_truncated);
         session.stop().unwrap();
     }
 
@@ -1139,7 +1352,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn recorded_session_rejects_resize_until_timelines_support_geometry_changes() {
+    fn recorded_session_encodes_resize_in_its_timeline() {
         let record = std::env::temp_dir().join(format!(
             "cellshot-recorded-resize-test-{}.cellshot",
             std::process::id()
@@ -1152,12 +1365,39 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            session.resize(100, 32, 9, 18).unwrap_err().to_string(),
-            "resizing recorded sessions is not yet supported"
-        );
+        session.resize(100, 32, 9, 18).unwrap();
         session.stop().unwrap();
+        let recording = recording::read(&record).unwrap();
+        assert!(matches!(
+            recording.events.last(),
+            Some(recording::Entry::Resize {
+                cols: 100,
+                rows: 32,
+                ..
+            })
+        ));
         let _ = std::fs::remove_file(record);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn waits_for_exit_without_polling_status() {
+        let mut session = Session::start(
+            &["sh".to_owned(), "-c".to_owned(), "exit 3".to_owned()],
+            None,
+            None,
+            &Options::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            session
+                .wait_for_exit(Duration::from_secs(2))
+                .unwrap()
+                .unwrap()
+                .code,
+            3
+        );
     }
 
     #[cfg(unix)]
@@ -1227,5 +1467,56 @@ mod tests {
         session.stop().unwrap();
         assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
         let _ = std::fs::remove_file(pid_path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn natural_parent_exit_terminates_pty_holding_descendants() {
+        let pid_path = std::env::temp_dir().join(format!(
+            "cellshot-exited-owner-test-{}.pid",
+            std::process::id()
+        ));
+        let script = format!(
+            "sleep 30 & printf '%s' $! > '{}'; exit 0",
+            pid_path.display()
+        );
+        let mut session = Session::start(
+            &["sh".to_owned(), "-c".to_owned(), script],
+            None,
+            None,
+            &Options::default(),
+        )
+        .unwrap();
+
+        session
+            .wait_for_exit(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        let pid = std::fs::read_to_string(&pid_path)
+            .unwrap()
+            .parse::<i32>()
+            .unwrap();
+
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        let _ = std::fs::remove_file(pid_path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_start_failure_removes_bound_socket() {
+        let socket = std::env::temp_dir().join(format!(
+            "cellshot-failed-daemon-start-{}.sock",
+            std::process::id()
+        ));
+        let result = serve(
+            socket.clone(),
+            vec!["/definitely/not/a/cellshot-command".to_owned()],
+            None,
+            None,
+            Options::default(),
+        );
+
+        assert!(result.is_err());
+        assert!(!socket.exists());
     }
 }

@@ -81,7 +81,7 @@ cellshot session stop demo
 printf '%s' 'Summarize the active view.' | cellshot session send demo --stdin
 ```
 
-`session resize` controls the terminal viewport for non-recording sessions. Recorded sessions reject resize until recording timelines include geometry changes.
+`session resize` controls the terminal viewport and records geometry changes in `.cellshot` timelines when recording is enabled. A session whose retained ANSI transcript has already been truncated cannot be resized because its current screen cannot be replayed at a new size safely.
 
 For normal-screen tools and long-running log processes, inspect retained scrollback directly:
 
@@ -90,7 +90,7 @@ cellshot session history demo
 cellshot session history demo --ansi > captures/demo-history.ansi
 ```
 
-Full-screen alternate-screen TUIs do not provide terminal scrollback; observe those with `shot` or a recording timeline instead.
+Full-screen alternate-screen TUIs do not provide terminal scrollback; observe those with `shot` or a recording timeline instead. Session status exposes `history_truncated` after raw retained ANSI reaches `--max-bytes`; the session continues running and retains its most recent transcript bytes.
 
 Restart a single named owner safely when deploying updated code:
 
@@ -175,16 +175,17 @@ session.send(b"help\r")?;
 session.wait_for_idle(Duration::from_millis(250), Duration::from_secs(5))?;
 let capture = session.capture(Duration::from_millis(250), Duration::from_secs(5))?;
 let shot = capture.shot;
+let exit = session.wait_for_exit(Duration::from_secs(5))?;
 session.stop()?;
 ```
 
 Structured output is versioned for external tools:
 
 - A `--format json` shot is a `Frame` object with `version: 1`, described by `schemas/frame-v1.schema.json`.
-- A `.cellshot` recording is JSON Lines: its first line is a versioned header and subsequent lines are timed output or input entries, each described by `schemas/recording-entry-v1.schema.json`.
+- A `.cellshot` recording is JSON Lines: its first line is a versioned header and subsequent lines are timed output, input, or resize entries, each described by `schemas/recording-entry-v1.schema.json`.
 - Recording byte arrays contain the original terminal or input bytes as integers from `0` to `255`; recordings can contain sensitive text or input.
 
-`session::Session` is the embedded lifecycle interface; the named CLI session commands are an adapter over the same implementation. This is also the intended seam for a future long-lived TypeScript driver process.
+`session::Session` is the embedded lifecycle interface; the named CLI session commands and the external driver are adapters over the same implementation.
 
 ## External Driver
 
@@ -194,17 +195,95 @@ External agent tooling can keep multiple embedded sessions alive through a versi
 cellshot driver
 ```
 
-The driver writes a `hello` message with protocol and cellshot versions, then accepts typed operations including `launch`, `status`, `send`, `waitForText`, `waitForIdle`, `shot`, `history`, `resize`, `stop`, and `shutdown`. It is intended for clients such as a TypeScript TUI test or agent-control library, while the shell-facing `session` commands remain convenient for individual workflows.
+The driver writes a `hello` message with protocol and cellshot versions, then accepts typed operations including `launch`, `status`, `send`, `waitForText`, `waitForIdle`, `waitForExit`, `shot`, `history`, `recording`, `resize`, `stop`, and `shutdown`. It is intended for clients such as a TypeScript TUI test or agent-control library, while the shell-facing `session` commands remain convenient for individual workflows.
 
 ```json
 {"type":"hello","protocolVersion":1,"cellshotVersion":"<installed-version>"}
-{"id":1,"method":"launch","sessionId":"app","params":{"command":["my-terminal-app"],"cols":100,"rows":30}}
+{"id":1,"method":"launch","sessionId":"app","params":{"command":["my-terminal-app"],"cols":100,"rows":30,"inheritEnv":false,"env":{"TERM":"xterm-256color"}}}
 {"id":2,"method":"waitForText","sessionId":"app","params":{"text":"Ready","timeoutMs":5000}}
 {"id":3,"method":"send","sessionId":"app","params":{"input":[{"type":"text","value":"help"},{"type":"key","value":"enter"}]}}
 {"id":4,"method":"shot","sessionId":"app","params":{"settleMs":250,"deadlineMs":5000}}
 ```
 
-A driver `shot` response contains a structured `Shot` and a capture `reason`: `idle`, `deadline`, `exited`, or `outputclosed`. A test client should normally require `idle` or `exited` instead of accepting a deadline fallback as a stable snapshot. Driver input is intentionally exact: text, raw bytes, known key values, and single-letter control input are supported without claiming unimplemented key chords.
+A driver `shot` response contains a structured visible frame, derived `text`, and a capture `reason`: `idle`, `deadline`, `exited`, or `outputclosed`. Raw ANSI is omitted by default; request `includeAnsi: true` for retained transcript bytes or `includeSvg: true` for rendered visual evidence. A test client should normally require `idle` or `exited` instead of accepting a deadline fallback as a stable snapshot. Driver input is intentionally exact: text, raw bytes, known key values, and single-letter control input are supported without claiming unimplemented key chords.
+
+## TypeScript Client
+
+The private experimental package under `packages/test` exposes the driver as isolated typed test sessions. It deliberately separates the visible screen from retained history and the exact ANSI/VT transcript. Until platform-native npm packages are published, provide a built `cellshot` through `binaryPath` or `CELLSHOT_BINARY`; the resolver is already structured to load future optional native packages automatically.
+
+```ts
+import { createCellshot } from "@cellshot/test"
+
+await using cellshot = await createCellshot({
+  binaryPath: "./target/release/cellshot",
+  artifacts: {
+    directory: ".cellshot-artifacts",
+    onFailure: true,
+    includeTranscript: false,
+    includeRecording: true,
+  },
+})
+await using session = await cellshot.launch({
+  command: ["/absolute/path/to/my-terminal-app"],
+  viewport: { cols: 100, rows: 30 },
+  inheritEnv: false,
+  env: { TERM: "xterm-256color", HOME: "/tmp/test-home" },
+  record: "on-failure",
+})
+
+await session.screen.waitForText(/Ready/)
+await session.keyboard.type("help")
+await session.keyboard.press("Enter")
+
+const text = await session.screen.text()
+const frame = await session.screen.frame()
+const history = await session.history.text()
+const transcript = await session.transcript.ansi()
+
+expect(text).toMatchSnapshot()
+expect(frame).toMatchSnapshot()
+
+const exit = await session.waitForExit({ timeoutMs: 5_000 })
+expect(exit).toMatchObject({ reason: "exited", exit: { code: 0 } })
+```
+
+`session.screen.text()` and `session.screen.frame()` wait for a settled capture and reject deadline or output-closed fallback by default. A test that intentionally needs an intermediate frame can request it explicitly:
+
+```ts
+const capture = await session.screen.capture({ allowIncomplete: true })
+console.log(capture.reason, capture.text, capture.frame)
+```
+
+This makes ordinary text or frame snapshots stable by default while retaining explicit access to live, incomplete terminal state.
+
+Keyboard presses are typed as the sequences Cellshot encodes exactly, such as `"Enter"`, `"ArrowDown"`, or `"Control+C"`. Use `session.keyboard.write(bytes)` when a test deliberately needs exact terminal bytes outside that supported key set.
+
+Vitest users can add a screen-aware assertion that writes configured artifacts on failure. Standard `toMatchSnapshot()` and `toMatchInlineSnapshot()` remain the simplest snapshot format because visible text is reviewable in source control:
+
+```ts
+import { expect } from "vitest"
+import { extendCellshotMatchers } from "@cellshot/test/vitest"
+
+extendCellshotMatchers(expect)
+
+await expect(session).toHaveScreenText("Ready\n\nChoose an option")
+await expect(session.screen.text()).resolves.toMatchInlineSnapshot()
+```
+
+`session.writeArtifacts(name)` and failing `toHaveScreenText(...)` assertions can write `screen.txt`, `screen.json`, `screen.svg`, `history.txt`, and `metadata.json`. `transcript.ansi` and `recording.cellshot` are opt-in because terminal streams and typed input may contain secrets. Wrap ordinary snapshot assertions when evidence should be saved on any thrown assertion:
+
+```ts
+await session.withArtifactsOnFailure("settings-snapshot", async () => {
+  await expect(session.screen.text()).resolves.toMatchSnapshot()
+})
+```
+
+Enable a recording with `record: true` or `record: "on-failure"`; a test may explicitly save it before disposing the session:
+
+```ts
+await session.resize({ cols: 120, rows: 40 })
+await session.saveRecording("artifacts/navigation.cellshot")
+```
 
 ## Notes
 

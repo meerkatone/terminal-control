@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Command as ProcessCommand, Stdio};
@@ -31,6 +32,10 @@ pub struct Options {
     pub max_bytes: usize,
     pub opentui_host: bool,
     pub color: ColorMode,
+    /// Additional environment values set in the observed terminal application.
+    pub env: BTreeMap<String, String>,
+    /// Whether the terminal application inherits the parent process environment.
+    pub inherit_env: bool,
 }
 
 impl Default for Options {
@@ -48,6 +53,8 @@ impl Default for Options {
             max_bytes: 16 * 1024 * 1024,
             opentui_host: false,
             color: ColorMode::Auto,
+            env: BTreeMap::new(),
+            inherit_env: true,
         }
     }
 }
@@ -69,6 +76,7 @@ pub enum ColorMode {
 
 /// Construct a shot by replaying an ANSI/VT byte stream into a terminal frame.
 pub fn from_ansi(bytes: Vec<u8>, rows: u16, cols: u16, max_bytes: usize) -> Result<Shot> {
+    validate_geometry(rows, cols)?;
     if bytes.len() > max_bytes {
         bail!("terminal input exceeds --max-bytes ({max_bytes})");
     }
@@ -85,6 +93,7 @@ pub fn from_command(command: &[String], cwd: Option<&Path>, options: &Options) -
     if command.is_empty() {
         bail!("provide a command after --");
     }
+    validate_geometry(options.rows, options.cols)?;
     let pair = native_pty_system()
         .openpty(PtySize {
             rows: options.rows,
@@ -95,7 +104,7 @@ pub fn from_command(command: &[String], cwd: Option<&Path>, options: &Options) -
         .context("open pseudo-terminal")?;
     let mut builder = CommandBuilder::new(&command[0]);
     builder.args(&command[1..]);
-    configure_pty_environment(&mut builder, options.color);
+    configure_pty_environment(&mut builder, options);
     if let Some(cwd) = cwd {
         builder.cwd(cwd);
     }
@@ -196,6 +205,7 @@ pub fn from_pipe_command(
     if command.is_empty() {
         bail!("provide a command after --");
     }
+    validate_geometry(options.rows, options.cols)?;
     let mut builder = ProcessCommand::new(&command[0]);
     builder
         .args(&command[1..])
@@ -207,7 +217,7 @@ pub fn from_pipe_command(
         use std::os::unix::process::CommandExt;
         builder.process_group(0);
     }
-    configure_process_environment(&mut builder, options.color);
+    configure_process_environment(&mut builder, options);
     if let Some(cwd) = cwd {
         builder.current_dir(cwd);
     }
@@ -315,10 +325,13 @@ impl LinefeedNormalizer {
     }
 }
 
-pub(crate) fn configure_pty_environment(builder: &mut CommandBuilder, color: ColorMode) {
+pub(crate) fn configure_pty_environment(builder: &mut CommandBuilder, options: &Options) {
+    if !options.inherit_env {
+        builder.env_clear();
+    }
     builder.env("TERM", "xterm-truecolor");
     builder.env("COLORTERM", "truecolor");
-    match color {
+    match options.color {
         ColorMode::Auto => {}
         ColorMode::Always => {
             builder.env_remove("NO_COLOR");
@@ -332,13 +345,19 @@ pub(crate) fn configure_pty_environment(builder: &mut CommandBuilder, color: Col
             builder.env("CLICOLOR", "0");
             builder.env("CLICOLOR_FORCE", "0");
         }
+    }
+    for (key, value) in &options.env {
+        builder.env(key, value);
     }
 }
 
-fn configure_process_environment(builder: &mut ProcessCommand, color: ColorMode) {
+fn configure_process_environment(builder: &mut ProcessCommand, options: &Options) {
+    if !options.inherit_env {
+        builder.env_clear();
+    }
     builder.env("TERM", "xterm-truecolor");
     builder.env("COLORTERM", "truecolor");
-    match color {
+    match options.color {
         ColorMode::Auto => {}
         ColorMode::Always => {
             builder.env_remove("NO_COLOR");
@@ -353,10 +372,18 @@ fn configure_process_environment(builder: &mut ProcessCommand, color: ColorMode)
             builder.env("CLICOLOR_FORCE", "0");
         }
     }
+    builder.envs(&options.env);
 }
 
 pub(crate) fn terminal(rows: u16, cols: u16) -> Parser {
     Parser::new(rows, cols, 0)
+}
+
+pub(crate) fn validate_geometry(rows: u16, cols: u16) -> Result<()> {
+    if rows == 0 || cols == 0 {
+        bail!("terminal dimensions must be greater than zero");
+    }
+    Ok(())
 }
 
 fn consume_until_ready(
@@ -623,6 +650,8 @@ mod tests {
                 max_bytes: 1024,
                 opentui_host: false,
                 color: ColorMode::Auto,
+                env: BTreeMap::new(),
+                inherit_env: true,
             },
         )
         .unwrap();
@@ -671,6 +700,8 @@ mod tests {
                 max_bytes: 1,
                 opentui_host: true,
                 color: ColorMode::Auto,
+                env: BTreeMap::new(),
+                inherit_env: true,
             },
         );
 
@@ -684,5 +715,11 @@ mod tests {
         assert!(output.contains("\x1b[4;480;900t"));
         assert!(output.contains("\x1b]4;0;rgb:0000/0000/0000\x1b\\"));
         assert!(output.contains("\x1b_Gi=31337;EINVAL:graphics unavailable\x1b\\"));
+    }
+
+    #[test]
+    fn rejects_zero_terminal_geometry_before_parsing() {
+        assert!(from_ansi(Vec::new(), 0, 1, 1).is_err());
+        assert!(from_ansi(Vec::new(), 1, 0, 1).is_err());
     }
 }

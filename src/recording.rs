@@ -16,6 +16,7 @@ pub const FORMAT_VERSION: u8 = 1;
 
 /// One JSON Lines entry in a `.cellshot` recording timeline.
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum Entry {
     Header {
@@ -33,6 +34,13 @@ pub enum Entry {
         at_ms: u64,
         origin: InputOrigin,
         bytes: Vec<u8>,
+    },
+    Resize {
+        at_ms: u64,
+        cols: u16,
+        rows: u16,
+        cell_width: u16,
+        cell_height: u16,
     },
 }
 
@@ -58,6 +66,7 @@ impl Writer {
         cell_width: u16,
         cell_height: u16,
     ) -> Result<Self> {
+        crate::shot::validate_geometry(rows, cols)?;
         if let Some(parent) = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
@@ -111,6 +120,23 @@ impl Writer {
         })
     }
 
+    pub fn resize(
+        &mut self,
+        cols: u16,
+        rows: u16,
+        cell_width: u16,
+        cell_height: u16,
+    ) -> Result<()> {
+        crate::shot::validate_geometry(rows, cols)?;
+        self.write(Entry::Resize {
+            at_ms: self.started.elapsed().as_millis() as u64,
+            cols,
+            rows,
+            cell_width,
+            cell_height,
+        })
+    }
+
     fn write(&mut self, entry: Entry) -> Result<()> {
         serde_json::to_writer(&mut self.file, &entry).context("write recording event")?;
         self.file
@@ -147,7 +173,7 @@ pub fn video(path: &Path, options: &VideoOptions) -> Result<()> {
     if states.is_empty() {
         bail!("recording contains no visible output frames");
     }
-    let frames = samples(states, options);
+    let frames = common_canvas(samples(states, options));
     if let Some(parent) = options
         .out
         .parent()
@@ -164,6 +190,12 @@ pub fn video(path: &Path, options: &VideoOptions) -> Result<()> {
             .as_nanos()
     ));
     fs::create_dir_all(&temp).with_context(|| format!("create {}", temp.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&temp, fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("secure {}", temp.display()))?;
+    }
     let result = render_video_frames(&temp, &recording, &frames, options);
     let _ = fs::remove_dir_all(&temp);
     result
@@ -200,12 +232,19 @@ pub fn read(path: &Path) -> Result<Recording> {
     if version != FORMAT_VERSION {
         bail!("unsupported recording version {version}");
     }
+    crate::shot::validate_geometry(rows, cols)?;
     let events = lines
         .map(|line| {
             serde_json::from_str(&line.context("read recording event")?)
                 .context("parse recording event")
         })
         .collect::<Result<Vec<Entry>>>()?;
+    if events
+        .iter()
+        .any(|entry| matches!(entry, Entry::Header { .. }))
+    {
+        bail!("recording contains a header after the first line");
+    }
     Ok(Recording {
         cols,
         rows,
@@ -222,16 +261,28 @@ struct VideoFrame {
 
 fn states(recording: &Recording) -> Vec<VideoFrame> {
     let mut parser = crate::shot::terminal(recording.rows, recording.cols);
+    let mut output = Vec::new();
     let mut frames: Vec<VideoFrame> = Vec::new();
     frames.push(VideoFrame {
         at_ms: 0,
         frame: from_screen(parser.screen()),
     });
     for event in &recording.events {
-        let Entry::Output { at_ms, bytes } = event else {
-            continue;
+        let at_ms = match event {
+            Entry::Output { at_ms, bytes } => {
+                output.extend_from_slice(bytes);
+                parser.process(bytes);
+                *at_ms
+            }
+            Entry::Resize {
+                at_ms, cols, rows, ..
+            } => {
+                parser = crate::shot::terminal(*rows, *cols);
+                parser.process(&output);
+                *at_ms
+            }
+            Entry::Input { .. } | Entry::Header { .. } => continue,
         };
-        parser.process(bytes);
         let frame = from_screen(parser.screen());
         if frames
             .last()
@@ -239,10 +290,17 @@ fn states(recording: &Recording) -> Vec<VideoFrame> {
         {
             continue;
         }
-        frames.push(VideoFrame {
-            at_ms: *at_ms,
-            frame,
-        });
+        frames.push(VideoFrame { at_ms, frame });
+    }
+    frames
+}
+
+fn common_canvas(mut frames: Vec<Frame>) -> Vec<Frame> {
+    let cols = frames.iter().map(|frame| frame.cols).max().unwrap_or(0);
+    let rows = frames.iter().map(|frame| frame.rows).max().unwrap_or(0);
+    for frame in &mut frames {
+        frame.cols = cols;
+        frame.rows = rows;
     }
     frames
 }
@@ -340,7 +398,6 @@ fn render_video_frames(
     if !status.success() {
         bail!("ffmpeg failed while exporting {}", options.out.display());
     }
-    println!("{}", options.out.display());
     Ok(())
 }
 
@@ -440,6 +497,38 @@ mod tests {
     }
 
     #[test]
+    fn replays_resized_recordings_on_a_stable_video_canvas() {
+        let recording = Recording {
+            cols: 2,
+            rows: 1,
+            cell_width: 9,
+            cell_height: 18,
+            events: vec![
+                Entry::Output {
+                    at_ms: 1,
+                    bytes: b"a".to_vec(),
+                },
+                Entry::Resize {
+                    at_ms: 2,
+                    cols: 4,
+                    rows: 2,
+                    cell_width: 9,
+                    cell_height: 18,
+                },
+            ],
+        };
+
+        let frames = common_canvas(samples(&states(&recording), &options()));
+
+        assert!(
+            frames
+                .iter()
+                .all(|frame| (frame.cols, frame.rows) == (4, 2))
+        );
+        assert_eq!(frames.last().unwrap().text(), "a");
+    }
+
+    #[test]
     fn preserves_background_only_output_when_no_text_is_recorded() {
         let painted = painted_frame();
         let frames = vec![
@@ -515,5 +604,16 @@ mod tests {
                 .to_string(),
             "--fps must not exceed 1000"
         );
+    }
+
+    #[test]
+    fn rejects_invalid_geometry_and_repeated_headers() {
+        let invalid =
+            std::env::temp_dir().join(format!("cellshot-invalid-recording-{}", std::process::id()));
+        fs::write(&invalid, "{\"type\":\"header\",\"version\":1,\"cols\":0,\"rows\":1,\"cell_width\":9,\"cell_height\":18}\n").unwrap();
+        assert!(read(&invalid).is_err());
+        fs::write(&invalid, "{\"type\":\"header\",\"version\":1,\"cols\":1,\"rows\":1,\"cell_width\":9,\"cell_height\":18}\n{\"type\":\"header\",\"version\":1,\"cols\":1,\"rows\":1,\"cell_width\":9,\"cell_height\":18}\n").unwrap();
+        assert!(read(&invalid).is_err());
+        let _ = fs::remove_file(invalid);
     }
 }

@@ -86,7 +86,7 @@ impl Frame {
         let mut rows =
             vec![vec![String::from(" "); usize::from(self.cols)]; usize::from(self.rows)];
         for cell in &self.cells {
-            if cell.text.is_empty() {
+            if cell.text.is_empty() || cell.x >= self.cols || cell.y >= self.rows {
                 continue;
             }
             rows[usize::from(cell.y)][usize::from(cell.x)] = cell.text.clone();
@@ -342,5 +342,21 @@ mod tests {
         parser.process(b"\x1b[48;2;30;34;42m ");
 
         assert!(from_screen(parser.screen()).has_visible_content());
+    }
+
+    #[test]
+    fn text_ignores_out_of_bounds_external_cells() {
+        let mut frame = from_screen(vt100::Parser::new(1, 1, 0).screen());
+        frame.cells.push(Cell {
+            x: 2,
+            y: 0,
+            text: "x".to_owned(),
+            width: 1,
+            foreground: DEFAULT_FOREGROUND,
+            background: DEFAULT_BACKGROUND,
+            attributes: Attributes::default(),
+        });
+
+        assert_eq!(frame.text(), "");
     }
 }

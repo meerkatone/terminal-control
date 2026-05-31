@@ -1,4 +1,6 @@
 /target
+/packages/test/node_modules
+/.cellshot-artifacts
 /captures
 /docs/screenshots/*.ansi
 /docs/screenshots/*.json

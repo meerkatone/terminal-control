@@ -6,10 +6,12 @@
   "oneOf": [
     { "$ref": "#/$defs/header" },
     { "$ref": "#/$defs/output" },
-    { "$ref": "#/$defs/input" }
+    { "$ref": "#/$defs/input" },
+    { "$ref": "#/$defs/resize" }
   ],
   "$defs": {
     "dimension": { "type": "integer", "minimum": 0, "maximum": 65535 },
+    "terminalDimension": { "type": "integer", "minimum": 1, "maximum": 65535 },
     "byteArray": {
       "type": "array",
       "items": { "type": "integer", "minimum": 0, "maximum": 255 }
@@ -21,8 +23,8 @@
       "properties": {
         "type": { "const": "header" },
         "version": { "const": 1 },
-        "cols": { "$ref": "#/$defs/dimension" },
-        "rows": { "$ref": "#/$defs/dimension" },
+        "cols": { "$ref": "#/$defs/terminalDimension" },
+        "rows": { "$ref": "#/$defs/terminalDimension" },
         "cell_width": { "$ref": "#/$defs/dimension" },
         "cell_height": { "$ref": "#/$defs/dimension" }
       }
@@ -46,6 +48,19 @@
         "at_ms": { "type": "integer", "minimum": 0 },
         "origin": { "enum": ["client", "host"] },
         "bytes": { "$ref": "#/$defs/byteArray" }
+      }
+    },
+    "resize": {
+      "type": "object",
+      "required": ["type", "at_ms", "cols", "rows", "cell_width", "cell_height"],
+      "additionalProperties": false,
+      "properties": {
+        "type": { "const": "resize" },
+        "at_ms": { "type": "integer", "minimum": 0 },
+        "cols": { "$ref": "#/$defs/terminalDimension" },
+        "rows": { "$ref": "#/$defs/terminalDimension" },
+        "cell_width": { "$ref": "#/$defs/dimension" },
+        "cell_height": { "$ref": "#/$defs/dimension" }
       }
     }
   }

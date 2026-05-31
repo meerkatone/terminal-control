@@ -1,14 +1,19 @@
 //! Versioned stdio protocol for TypeScript and other external session clients.
 
 use std::collections::HashMap;
+use std::fs;
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::thread;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::render;
 use crate::session::Session;
 use crate::shot::{ColorMode, Options};
 
@@ -28,7 +33,7 @@ pub fn serve(reader: impl BufRead, mut writer: impl Write) -> Result<()> {
             "cellshotVersion": env!("CARGO_PKG_VERSION")
         }),
     )?;
-    let mut sessions = HashMap::<String, Session>::new();
+    let mut sessions = HashMap::<String, ManagedSession>::new();
     for line in reader.lines() {
         let line = match line {
             Ok(line) => line,
@@ -37,10 +42,23 @@ pub fn serve(reader: impl BufRead, mut writer: impl Write) -> Result<()> {
                 break;
             }
         };
-        let request = match serde_json::from_str::<Request>(&line) {
-            Ok(request) => request,
+        let value = match serde_json::from_str::<Value>(&line) {
+            Ok(value) => value,
             Err(error) => {
                 write_error(&mut writer, None, "INVALID_REQUEST", &error.to_string())?;
+                continue;
+            }
+        };
+        let request_id = value.get("id").and_then(Value::as_u64);
+        let request = match serde_json::from_value::<Request>(value) {
+            Ok(request) => request,
+            Err(error) => {
+                write_error(
+                    &mut writer,
+                    request_id,
+                    "INVALID_REQUEST",
+                    &error.to_string(),
+                )?;
                 continue;
             }
         };
@@ -82,8 +100,10 @@ enum Method {
     Send(SendParams),
     WaitForText(WaitForTextParams),
     WaitForIdle(WaitForIdleParams),
+    WaitForExit(WaitForExitParams),
     Shot(ShotParams),
     History(HistoryParams),
+    Recording,
     Resize(ResizeParams),
     Stop,
     Shutdown,
@@ -102,6 +122,10 @@ struct LaunchParams {
     max_bytes: Option<usize>,
     host: Option<HostProfile>,
     color: Option<DriverColorMode>,
+    #[serde(default)]
+    env: HashMap<String, String>,
+    #[serde(default = "default_true")]
+    inherit_env: bool,
 }
 
 #[derive(Clone, Copy, Deserialize)]
@@ -173,11 +197,22 @@ struct WaitForIdleParams {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct WaitForExitParams {
+    #[serde(default = "default_timeout_ms")]
+    timeout_ms: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ShotParams {
     #[serde(default = "default_settle_ms")]
     settle_ms: u64,
     #[serde(default = "default_timeout_ms")]
     deadline_ms: u64,
+    #[serde(default)]
+    include_ansi: bool,
+    #[serde(default)]
+    include_svg: bool,
 }
 
 #[derive(Default, Deserialize)]
@@ -195,7 +230,82 @@ struct ResizeParams {
     cell_height: Option<u16>,
 }
 
-fn dispatch(sessions: &mut HashMap<String, Session>, request: Request) -> Result<Value> {
+struct ManagedSession {
+    session: Arc<Mutex<Session>>,
+    stop: Arc<AtomicBool>,
+    error: Arc<Mutex<Option<String>>>,
+    recording: Option<PathBuf>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl ManagedSession {
+    fn new(session: Session, recording: Option<PathBuf>) -> Self {
+        let session = Arc::new(Mutex::new(session));
+        let stop = Arc::new(AtomicBool::new(false));
+        let error = Arc::new(Mutex::new(None));
+        let worker_session = Arc::clone(&session);
+        let worker_stop = Arc::clone(&stop);
+        let worker_error = Arc::clone(&error);
+        let worker = thread::spawn(move || {
+            while !worker_stop.load(Ordering::Relaxed) {
+                let result = worker_session.lock().unwrap().pump();
+                if let Err(error) = result {
+                    *worker_error.lock().unwrap() = Some(format!("{error:#}"));
+                    return;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        });
+        Self {
+            session,
+            stop,
+            error,
+            recording,
+            worker: Some(worker),
+        }
+    }
+
+    fn lock(&self) -> Result<MutexGuard<'_, Session>> {
+        if let Some(error) = self.error.lock().unwrap().clone() {
+            bail!("session output pump failed: {error}");
+        }
+        Ok(self.session.lock().unwrap())
+    }
+
+    fn stop(mut self) -> Result<()> {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+        {
+            let mut session = self.session.lock().unwrap();
+            session.stop()?;
+        }
+        Ok(())
+    }
+
+    fn recording(&self) -> Result<Vec<u8>> {
+        let path = self
+            .recording
+            .as_ref()
+            .ok_or_else(|| anyhow!("session was not launched with recording enabled"))?;
+        fs::read(path).map_err(Into::into)
+    }
+}
+
+impl Drop for ManagedSession {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+        if let Ok(mut session) = self.session.lock() {
+            let _ = session.stop();
+        }
+    }
+}
+
+fn dispatch(sessions: &mut HashMap<String, ManagedSession>, request: Request) -> Result<Value> {
     match request.method {
         Method::Launch(params) => {
             let session_id = required_session_id(&request.session_id)?;
@@ -209,7 +319,10 @@ fn dispatch(sessions: &mut HashMap<String, Session>, request: Request) -> Result
                 params.record.as_deref(),
                 &options,
             )?;
-            sessions.insert(session_id.to_owned(), session);
+            sessions.insert(
+                session_id.to_owned(),
+                ManagedSession::new(session, params.record.clone()),
+            );
             Ok(json!({ "sessionId": session_id }))
         }
         Method::Status => Ok(serde_json::to_value(
@@ -233,18 +346,57 @@ fn dispatch(sessions: &mut HashMap<String, Session>, request: Request) -> Result
             )?;
             Ok(Value::Null)
         }
-        Method::Shot(params) => Ok(serde_json::to_value(
-            session(sessions, &request.session_id)?.capture(
+        Method::WaitForExit(params) => {
+            let exit = session(sessions, &request.session_id)?
+                .wait_for_exit(Duration::from_millis(params.timeout_ms))?;
+            Ok(match exit {
+                Some(exit) => json!({ "reason": "exited", "exit": exit }),
+                None => json!({ "reason": "deadline" }),
+            })
+        }
+        Method::Shot(params) => {
+            let mut session = session(sessions, &request.session_id)?;
+            let mut capture = session.capture(
                 Duration::from_millis(params.settle_ms),
                 Duration::from_millis(params.deadline_ms),
-            )?,
-        )?),
+            )?;
+            let text = capture.shot.frame.text();
+            let svg = params
+                .include_svg
+                .then(|| -> Result<String> {
+                    let status = session.status()?;
+                    let mut options = render::Options::default();
+                    options.cell_width = f32::from(status.cell_width);
+                    options.cell_height = f32::from(status.cell_height);
+                    options.font_size = options.cell_height * 0.78;
+                    Ok(render::svg(&capture.shot.frame, &options))
+                })
+                .transpose()?;
+            if !params.include_ansi {
+                capture.shot.ansi.clear();
+            }
+            let mut result = serde_json::to_value(capture)?;
+            result["shot"]["text"] = json!(text);
+            if let Some(svg) = svg {
+                result["shot"]["svg"] = json!(svg);
+            }
+            Ok(result)
+        }
         Method::History(params) => Ok(json!({
             "ansi": params.ansi,
             "bytes": session(sessions, &request.session_id)?.history(params.ansi)?
         })),
+        Method::Recording => {
+            let session_id = required_session_id(&request.session_id)?;
+            Ok(json!({
+                "bytes": sessions
+                    .get(session_id)
+                    .ok_or_else(|| anyhow!("driver session {session_id:?} does not exist"))?
+                    .recording()?
+            }))
+        }
         Method::Resize(params) => {
-            let session = session(sessions, &request.session_id)?;
+            let mut session = session(sessions, &request.session_id)?;
             let status = session.status()?;
             session.resize(
                 params.cols,
@@ -256,17 +408,16 @@ fn dispatch(sessions: &mut HashMap<String, Session>, request: Request) -> Result
         }
         Method::Stop => {
             let session_id = required_session_id(&request.session_id)?;
-            let mut session = sessions
+            let session = sessions
                 .remove(session_id)
                 .ok_or_else(|| anyhow!("driver session {session_id:?} does not exist"))?;
             session.stop()?;
             Ok(Value::Null)
         }
         Method::Shutdown => {
-            for session in sessions.values_mut() {
+            for (_, session) in sessions.drain() {
                 session.stop()?;
             }
-            sessions.clear();
             Ok(Value::Null)
         }
     }
@@ -280,13 +431,14 @@ fn required_session_id(session_id: &Option<String>) -> Result<&str> {
 }
 
 fn session<'a>(
-    sessions: &'a mut HashMap<String, Session>,
+    sessions: &'a mut HashMap<String, ManagedSession>,
     session_id: &Option<String>,
-) -> Result<&'a mut Session> {
+) -> Result<MutexGuard<'a, Session>> {
     let session_id = required_session_id(session_id)?;
     sessions
-        .get_mut(session_id)
+        .get(session_id)
         .ok_or_else(|| anyhow!("driver session {session_id:?} does not exist"))
+        .and_then(ManagedSession::lock)
 }
 
 fn options(params: &LaunchParams) -> Options {
@@ -302,6 +454,8 @@ fn options(params: &LaunchParams) -> Options {
         Some(DriverColorMode::Never) => ColorMode::Never,
         Some(DriverColorMode::Auto) | None => ColorMode::Auto,
     };
+    options.env.extend(params.env.clone());
+    options.inherit_env = params.inherit_env;
     options
 }
 
@@ -359,6 +513,10 @@ fn default_timeout_ms() -> u64 {
     5_000
 }
 
+fn default_true() -> bool {
+    true
+}
+
 fn write_error(writer: &mut impl Write, id: Option<u64>, code: &str, message: &str) -> Result<()> {
     write_message(
         writer,
@@ -375,9 +533,26 @@ fn write_message(writer: &mut impl Write, message: &impl Serialize) -> Result<()
 
 #[cfg(test)]
 mod tests {
-    use std::io::{BufReader, Cursor};
+    use std::io::{BufReader, Cursor, Write};
+    #[cfg(unix)]
+    use std::os::unix::net::UnixStream;
+    use std::sync::{Arc, Mutex};
+    use std::thread;
 
     use super::*;
+
+    struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
 
     #[cfg(unix)]
     #[test]
@@ -391,7 +566,7 @@ mod tests {
             "\n",
             r#"{"id":4,"method":"waitForText","sessionId":"app","params":{"text":"got:hello","timeoutMs":2000}}"#,
             "\n",
-            r#"{"id":5,"method":"shot","sessionId":"app","params":{"settleMs":10,"deadlineMs":2000}}"#,
+            r#"{"id":5,"method":"shot","sessionId":"app","params":{"settleMs":10,"deadlineMs":2000,"includeAnsi":true}}"#,
             "\n",
             r#"{"id":6,"method":"stop","sessionId":"app"}"#,
             "\n",
@@ -414,7 +589,105 @@ mod tests {
         assert_eq!(messages[0]["protocolVersion"], PROTOCOL_VERSION);
         assert_eq!(messages[5]["result"]["reason"], "idle");
         assert!(messages[5]["result"]["shot"]["frame"]["cells"].is_array());
+        assert_eq!(
+            messages[5]["result"]["shot"]["text"],
+            "readyhello\n\ngot:hello"
+        );
+        assert!(messages[5]["result"]["shot"]["ansi"].is_array());
         assert_eq!(messages[7]["result"], Value::Null);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn driver_can_omit_ansi_when_a_client_only_needs_the_screen() {
+        let requests = concat!(
+            r#"{"id":1,"method":"launch","sessionId":"app","params":{"command":["sh","-c","printf ready; sleep 1"]}}"#,
+            "\n",
+            r#"{"id":2,"method":"waitForText","sessionId":"app","params":{"text":"ready","timeoutMs":2000}}"#,
+            "\n",
+            r#"{"id":3,"method":"shot","sessionId":"app","params":{"settleMs":10,"deadlineMs":2000,"includeAnsi":false}}"#,
+            "\n",
+            r#"{"id":4,"method":"shutdown"}"#,
+            "\n"
+        );
+        let mut output = Vec::new();
+
+        serve(
+            BufReader::new(Cursor::new(requests.as_bytes())),
+            &mut output,
+        )
+        .unwrap();
+
+        let messages = String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(messages[3]["result"]["shot"]["text"], "ready");
+        assert_eq!(messages[3]["result"]["shot"]["ansi"], json!([]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn driver_launch_can_clear_and_supply_environment() {
+        unsafe { std::env::set_var("CELLSHOT_PARENT_ONLY", "leak") };
+        let requests = concat!(
+            r#"{"id":1,"method":"launch","sessionId":"app","params":{"command":["/bin/sh","-c","printf '%s:%s' \"${CELLSHOT_PARENT_ONLY-unset}\" \"$VISIBLE\""],"inheritEnv":false,"env":{"VISIBLE":"set"}}}"#,
+            "\n",
+            r#"{"id":2,"method":"shot","sessionId":"app","params":{"settleMs":10,"deadlineMs":2000}}"#,
+            "\n",
+            r#"{"id":3,"method":"shutdown"}"#,
+            "\n"
+        );
+        let mut output = Vec::new();
+        serve(
+            BufReader::new(Cursor::new(requests.as_bytes())),
+            &mut output,
+        )
+        .unwrap();
+        unsafe { std::env::remove_var("CELLSHOT_PARENT_ONLY") };
+
+        let messages = String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(messages[2]["result"]["shot"]["text"], "unset:set");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn driver_waits_for_exit_and_renders_svg_evidence() {
+        let requests = concat!(
+            r#"{"id":1,"method":"launch","sessionId":"app","params":{"command":["sh","-c","printf done; exit 4"]}}"#,
+            "\n",
+            r#"{"id":2,"method":"waitForExit","sessionId":"app","params":{"timeoutMs":2000}}"#,
+            "\n",
+            r#"{"id":3,"method":"shot","sessionId":"app","params":{"includeSvg":true}}"#,
+            "\n",
+            r#"{"id":4,"method":"shutdown"}"#,
+            "\n"
+        );
+        let mut output = Vec::new();
+        serve(
+            BufReader::new(Cursor::new(requests.as_bytes())),
+            &mut output,
+        )
+        .unwrap();
+        let messages = String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(messages[2]["result"]["reason"], "exited");
+        assert_eq!(messages[2]["result"]["exit"]["code"], 4);
+        assert!(
+            messages[3]["result"]["shot"]["svg"]
+                .as_str()
+                .unwrap()
+                .starts_with("<svg")
+        );
     }
 
     #[test]
@@ -422,5 +695,54 @@ mod tests {
         assert!(control_bytes("meta").is_err());
         assert!(control_bytes("1").is_err());
         assert_eq!(control_bytes("C").unwrap(), b"\x03");
+    }
+
+    #[test]
+    fn invalid_typed_request_preserves_its_id() {
+        let requests = "{\"id\":41,\"method\":\"noSuchMethod\",\"sessionId\":\"app\"}\n";
+        let mut output = Vec::new();
+        serve(
+            BufReader::new(Cursor::new(requests.as_bytes())),
+            &mut output,
+        )
+        .unwrap();
+        let messages = String::from_utf8(output).unwrap();
+        let error = serde_json::from_str::<Value>(messages.lines().nth(1).unwrap()).unwrap();
+
+        assert_eq!(error["id"], 41);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn idle_driver_continues_pumping_verbose_sessions() {
+        let marker =
+            std::env::temp_dir().join(format!("cellshot-driver-pump-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let (mut requests, input) = UnixStream::pair().unwrap();
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let writer = SharedWriter(Arc::clone(&output));
+        let marker_command = format!(
+            "i=0; while [ $i -lt 100 ]; do printf 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'; i=$((i+1)); done; : > '{}'; sleep 1",
+            marker.display()
+        );
+        let launch = serde_json::to_string(&json!({
+            "id": 1,
+            "method": "launch",
+            "sessionId": "noisy",
+            "params": { "command": ["sh", "-c", marker_command] }
+        }))
+        .unwrap();
+        let handle = thread::spawn(move || serve(BufReader::new(input), writer).unwrap());
+        writeln!(requests, "{launch}").unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !marker.exists() && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        writeln!(requests, "{}", json!({"id":2,"method":"shutdown"})).unwrap();
+        drop(requests);
+        handle.join().unwrap();
+
+        assert!(marker.exists(), "driver did not pump output while idle");
+        let _ = std::fs::remove_file(marker);
     }
 }

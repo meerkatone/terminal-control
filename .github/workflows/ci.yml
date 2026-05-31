@@ -17,4 +17,8 @@ jobs:
       - run: cargo test
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo build --release
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --cwd packages/test --frozen-lockfile
+      - run: bun run --cwd packages/test typecheck
+      - run: CELLSHOT_TEST_BINARY="$PWD/target/release/cellshot" bun test packages/test/src/index.test.ts
       - run: cargo package --list

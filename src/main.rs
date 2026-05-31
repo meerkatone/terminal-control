@@ -115,8 +115,9 @@ Example:
 
 const DRIVER_HELP: &str = "\
 Driver mode serves isolated embedded sessions as newline-delimited JSON over standard input and
-standard output. It is intended for typed clients such as a future `@cellshot/test` package;
-standard output contains protocol messages only.
+standard output. It is used by the experimental `@cellshot/test` package; standard output
+contains protocol messages only. Driver sessions support isolated child environments, stable
+shots, SVG evidence, recordings, resizing, and explicit exit waiting.
 
 Example:
   cellshot driver";
@@ -489,6 +490,7 @@ fn main() -> Result<()> {
         Command::Shot(args) => shot(args)?,
         Command::Session { command } => session_command(command)?,
         Command::Video(args) => {
+            let out = args.out.clone();
             recording::video(
                 &args.input,
                 &recording::VideoOptions {
@@ -505,6 +507,7 @@ fn main() -> Result<()> {
                     include_startup: args.include_startup,
                 },
             )?;
+            println!("{}", out.display());
         }
         Command::Driver => {
             driver::serve(BufReader::new(io::stdin().lock()), io::stdout().lock())?;
@@ -528,6 +531,8 @@ fn main() -> Result<()> {
                     max_bytes: args.max_bytes,
                     opentui_host: args.opentui_host,
                     color: args.color.into(),
+                    env: Default::default(),
+                    inherit_env: true,
                 },
             )?;
         }
@@ -632,6 +637,8 @@ fn shot(args: ShotArgs) -> Result<()> {
         max_bytes,
         opentui_host: matches!(args.host, Some(HostProfile::Opentui)),
         color: color.into(),
+        env: Default::default(),
+        inherit_env: true,
     };
     let captured = if args.pipe {
         shot_engine::from_pipe_command(&args.command, args.cwd.as_deref(), &options)
@@ -757,6 +764,8 @@ fn start_session(args: &StartArgs, restart: bool) -> Result<()> {
         max_bytes: args.max_bytes,
         opentui_host: matches!(args.host, Some(HostProfile::Opentui)),
         color: args.color.into(),
+        env: Default::default(),
+        inherit_env: true,
     };
     if restart {
         session::restart(

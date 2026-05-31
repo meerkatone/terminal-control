@@ -7,8 +7,8 @@
   "additionalProperties": false,
   "properties": {
     "version": { "const": 1 },
-    "cols": { "$ref": "#/$defs/dimension" },
-    "rows": { "$ref": "#/$defs/dimension" },
+    "cols": { "$ref": "#/$defs/terminalDimension" },
+    "rows": { "$ref": "#/$defs/terminalDimension" },
     "foreground": { "$ref": "#/$defs/color" },
     "background": { "$ref": "#/$defs/color" },
     "cursor": {
@@ -24,6 +24,7 @@
   },
   "$defs": {
     "dimension": { "type": "integer", "minimum": 0, "maximum": 65535 },
+    "terminalDimension": { "type": "integer", "minimum": 1, "maximum": 65535 },
     "channel": { "type": "integer", "minimum": 0, "maximum": 255 },
     "color": {
       "type": "object",

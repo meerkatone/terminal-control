@@ -1,0 +1,24 @@
+{
+  "name": "@cellshot/test",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "files": [
+    "src/index.ts",
+    "src/vitest.ts",
+    "README.md"
+  ],
+  "exports": {
+    ".": "./src/index.ts",
+    "./vitest": "./src/vitest.ts"
+  },
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.0",
+    "typescript": "^5.9.0",
+    "vitest": "^3.2.4"
+  }
+}
