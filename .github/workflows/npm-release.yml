@@ -101,11 +101,10 @@ jobs:
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org
+      - run: npm install --global npm@latest
       - uses: actions/download-artifact@v8
         with:
           pattern: npm-*
           path: npm-artifacts
           merge-multiple: true
       - run: node scripts/publish-npm-tarballs.mjs npm-artifacts
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

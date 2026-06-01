@@ -317,7 +317,9 @@ The skill covers one-off visible reads, named live-session workflows, OpenTUI st
 
 The npm workspace publishes `@kitlangton/terminal-control` with fixed-version platform packages: `@kitlangton/terminal-control-darwin-arm64`, `@kitlangton/terminal-control-darwin-x64`, `@kitlangton/terminal-control-linux-arm64-gnu`, and `@kitlangton/terminal-control-linux-x64-gnu`. The client is compiled to ESM JavaScript with declarations; each native package receives the release Rust executable during the `npm release` workflow.
 
-The initial unpublished npm packages are prepared at `0.1.0`. For subsequent user-facing npm changes, create a Changeset with `bunx changeset`, commit the generated release metadata, and apply version changes before running the workflow. Run the workflow with `publish: false` to assemble packages only, or `publish: true` to publish assembled tarballs after its clean Bun and Node/Vitest consumer validation passes.
+For subsequent user-facing npm changes, create a Changeset with `bunx changeset`, commit the generated release metadata, and apply version changes before running the workflow. Run the workflow with `publish: false` to assemble packages only, or `publish: true` to publish assembled tarballs after its clean Bun and Node/Vitest consumer validation passes.
+
+The publish job is prepared for npm trusted publishing through GitHub Actions OIDC. In npm package settings, configure `kitlangton/terminal-control` and workflow `npm-release.yml` as the trusted publisher for the client and each platform package before using `publish: true`.
 
 ## Notes
 
