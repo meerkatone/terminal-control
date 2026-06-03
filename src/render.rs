@@ -70,21 +70,42 @@ pub fn svg(frame: &Frame, options: &Options) -> String {
 }
 
 pub fn png(svg: &str, path: &Path, pixel_ratio: f32) -> Result<()> {
-    let mut options = resvg::usvg::Options::default();
-    options.fontdb_mut().load_system_fonts();
-    let tree =
-        resvg::usvg::Tree::from_data(svg.as_bytes(), &options).context("parse rendered SVG")?;
-    let size = tree.size().to_int_size();
-    let width = ((size.width() as f32) * pixel_ratio).ceil() as u32;
-    let height = ((size.height() as f32) * pixel_ratio).ceil() as u32;
-    let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height).context("allocate PNG canvas")?;
-    resvg::render(
-        &tree,
-        resvg::tiny_skia::Transform::from_scale(pixel_ratio, pixel_ratio),
-        &mut pixmap.as_mut(),
-    );
-    pixmap.save_png(path).context("write PNG artifact")?;
-    Ok(())
+    PngRenderer::new().render(svg, path, pixel_ratio)
+}
+
+pub struct PngRenderer {
+    options: resvg::usvg::Options<'static>,
+}
+
+impl PngRenderer {
+    pub fn new() -> Self {
+        let mut options = resvg::usvg::Options::default();
+        options.fontdb_mut().load_system_fonts();
+        Self { options }
+    }
+
+    pub fn render(&self, svg: &str, path: &Path, pixel_ratio: f32) -> Result<()> {
+        let tree = resvg::usvg::Tree::from_data(svg.as_bytes(), &self.options)
+            .context("parse rendered SVG")?;
+        let size = tree.size().to_int_size();
+        let width = ((size.width() as f32) * pixel_ratio).ceil() as u32;
+        let height = ((size.height() as f32) * pixel_ratio).ceil() as u32;
+        let mut pixmap =
+            resvg::tiny_skia::Pixmap::new(width, height).context("allocate PNG canvas")?;
+        resvg::render(
+            &tree,
+            resvg::tiny_skia::Transform::from_scale(pixel_ratio, pixel_ratio),
+            &mut pixmap.as_mut(),
+        );
+        pixmap.save_png(path).context("write PNG artifact")?;
+        Ok(())
+    }
+}
+
+impl Default for PngRenderer {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 fn graphic(cell: &Cell, options: &Options) -> Option<String> {
@@ -104,6 +125,17 @@ fn graphic(cell: &Cell, options: &Options) -> Option<String> {
             opacity.map_or_else(String::new, |value| format!(r#" opacity="{value}""#)),
         )
     };
+    let stroke_width = width.min(height) * 0.08;
+    let stroke_rect = |left: f32, top: f32, wide: f32, tall: f32| {
+        format!(
+            r#"<rect x="{}" y="{}" width="{}" height="{}" fill="none" stroke="{}" stroke-width="{stroke_width}"/>"#,
+            x + width * left,
+            y + height * top,
+            width * wide,
+            height * tall,
+            cell.foreground.css(),
+        )
+    };
     let single = |left: f32, top: f32, wide: f32, tall: f32| {
         rect(
             x + width * left,
@@ -113,6 +145,55 @@ fn graphic(cell: &Cell, options: &Options) -> Option<String> {
             None,
         )
     };
+    let circle = |center_x: f32, center_y: f32, radius: f32| {
+        format!(
+            r#"<circle cx="{}" cy="{}" r="{}" fill="{}"/>"#,
+            x + width * center_x,
+            y + height * center_y,
+            radius,
+            cell.foreground.css(),
+        )
+    };
+    let ring = |center_x: f32, center_y: f32, radius: f32| {
+        format!(
+            r#"<circle cx="{}" cy="{}" r="{}" fill="none" stroke="{}" stroke-width="{stroke_width}"/>"#,
+            x + width * center_x,
+            y + height * center_y,
+            radius,
+            cell.foreground.css(),
+        )
+    };
+    let diamond = |scale: f32, filled: bool| {
+        let center_x = x + width * 0.5;
+        let center_y = y + height * 0.5;
+        let half_width = width * 0.42 * scale;
+        let half_height = height * 0.36 * scale;
+        let points = format!(
+            "{center_x},{} {},{center_y} {center_x},{} {},{center_y}",
+            center_y - half_height,
+            center_x + half_width,
+            center_y + half_height,
+            center_x - half_width,
+        );
+        if filled {
+            return format!(
+                r#"<polygon points="{points}" fill="{}"/>"#,
+                cell.foreground.css()
+            );
+        }
+        format!(
+            r#"<polygon points="{points}" fill="none" stroke="{}" stroke-width="{stroke_width}"/>"#,
+            cell.foreground.css(),
+        )
+    };
+    let codepoint = char as u32;
+    if (0x2800..=0x28ff).contains(&codepoint) {
+        return Some(braille_dots(
+            codepoint - 0x2800,
+            &circle,
+            width.min(height) * 0.09,
+        ));
+    }
     Some(match char {
         '█' => single(0.0, 0.0, 1.0, 1.0),
         '▀' => single(0.0, 0.0, 1.0, 0.5),
@@ -142,10 +223,39 @@ fn graphic(cell: &Cell, options: &Options) -> Option<String> {
         '▛' => single(0.0, 0.0, 0.5, 1.0) + &single(0.5, 0.0, 0.5, 0.5),
         '▜' => single(0.5, 0.0, 0.5, 1.0) + &single(0.0, 0.0, 0.5, 0.5),
         '▟' => single(0.5, 0.0, 0.5, 1.0) + &single(0.0, 0.5, 0.5, 0.5),
+        '▣' => stroke_rect(0.18, 0.18, 0.64, 0.64) + &single(0.38, 0.38, 0.24, 0.24),
         '■' => single(0.1, 0.18, 0.8, 0.64),
         '⬝' => single(0.32, 0.38, 0.36, 0.28),
+        '◆' => diamond(1.0, true),
+        '◇' => diamond(1.0, false),
+        '◈' => diamond(1.0, false) + &diamond(0.42, true),
+        '⬥' => diamond(0.82, true),
+        '⬩' | '⬪' | '⬖' => diamond(0.52, true),
+        '●' => circle(0.5, 0.52, width.min(height) * 0.32),
+        '○' => ring(0.5, 0.52, width.min(height) * 0.32),
+        '◉' | '◍' => {
+            ring(0.5, 0.52, width.min(height) * 0.32) + &circle(0.5, 0.52, width.min(height) * 0.15)
+        }
+        '◔' => ring(0.5, 0.52, width.min(height) * 0.32) + &single(0.5, 0.2, 0.32, 0.32),
         _ => return None,
     })
+}
+
+fn braille_dots(pattern: u32, circle: &impl Fn(f32, f32, f32) -> String, radius: f32) -> String {
+    [
+        (0x01, 0.34, 0.2),
+        (0x02, 0.34, 0.38),
+        (0x04, 0.34, 0.56),
+        (0x40, 0.34, 0.74),
+        (0x08, 0.66, 0.2),
+        (0x10, 0.66, 0.38),
+        (0x20, 0.66, 0.56),
+        (0x80, 0.66, 0.74),
+    ]
+    .into_iter()
+    .filter(|(bit, _, _)| pattern & bit != 0)
+    .map(|(_, x, y)| circle(x, y, radius))
+    .collect::<String>()
 }
 
 fn text(cell: &Cell, options: &Options) -> String {
@@ -274,10 +384,10 @@ mod tests {
     }
 
     #[test]
-    fn renders_opencode_spinner_squares_as_geometry() {
+    fn renders_opencode_status_glyphs_as_geometry() {
         let frame = Frame {
             version: 1,
-            cols: 2,
+            cols: 16,
             rows: 1,
             foreground: Color {
                 r: 80,
@@ -286,7 +396,51 @@ mod tests {
             },
             background: Color { r: 0, g: 0, b: 0 },
             cursor: None,
-            cells: ["■", "⬝"]
+            cells: [
+                "■", "⬝", "▣", "◆", "◇", "◈", "⬥", "⬩", "⬪", "⬖", "●", "○", "◉", "◍", "◔",
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(x, text)| crate::frame::Cell {
+                x: x as u16,
+                y: 0,
+                text: text.to_owned(),
+                width: 1,
+                foreground: Color {
+                    r: 80,
+                    g: 140,
+                    b: 220,
+                },
+                background: Color { r: 0, g: 0, b: 0 },
+                attributes: Attributes::default(),
+            })
+            .collect(),
+        };
+
+        let output = svg(&frame, &Options::default());
+
+        for text in [
+            "■", "⬝", "▣", "◆", "◇", "◈", "⬥", "⬩", "⬪", "⬖", "●", "○", "◉", "◍", "◔",
+        ] {
+            assert!(!output.contains(&format!(">{text}</text>")));
+        }
+    }
+
+    #[test]
+    fn renders_braille_spinner_frames_as_geometry() {
+        let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        let frame = Frame {
+            version: 1,
+            cols: frames.len() as u16,
+            rows: 1,
+            foreground: Color {
+                r: 180,
+                g: 130,
+                b: 255,
+            },
+            background: Color { r: 0, g: 0, b: 0 },
+            cursor: None,
+            cells: frames
                 .into_iter()
                 .enumerate()
                 .map(|(x, text)| crate::frame::Cell {
@@ -295,9 +449,9 @@ mod tests {
                     text: text.to_owned(),
                     width: 1,
                     foreground: Color {
-                        r: 80,
-                        g: 140,
-                        b: 220,
+                        r: 180,
+                        g: 130,
+                        b: 255,
                     },
                     background: Color { r: 0, g: 0, b: 0 },
                     attributes: Attributes::default(),
@@ -307,8 +461,10 @@ mod tests {
 
         let output = svg(&frame, &Options::default());
 
-        assert!(!output.contains(">■</text>"));
-        assert!(!output.contains(">⬝</text>"));
+        assert!(output.contains("<circle"));
+        for text in frames {
+            assert!(!output.contains(&format!(">{text}</text>")));
+        }
     }
 
     #[test]

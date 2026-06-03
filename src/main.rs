@@ -31,9 +31,11 @@ Sources:
   termctrl show -- COMMAND...           Run a disposable command in a PTY.
   termctrl show --pipe -- COMMAND...    Read piped stdout/stderr.
   termctrl show --input FILE            Read ANSI/VT bytes from FILE, or use - for stdin.
+  termctrl show --recording FILE        Replay the final screen of a .termctrl recording.
 
 Use --format json, --format ansi, or --format svg for another stdout-readable representation.
-Use `save` to write files.";
+Use `--at-marker NAME` or `--at-ms MS` with --recording to inspect an exact moment. Use `save`
+to write files.";
 
 const SAVE_HELP: &str = "\
 Save freezes a visible terminal screen and writes exactly the requested artifact formats.
@@ -42,6 +44,7 @@ Examples:
   termctrl save demo --format png --out captures/current.png
   termctrl save demo --format png --format txt --out captures/current
   termctrl save --input debug.ansi --format png --out captures/replay.png
+  termctrl save --recording captures/demo.termctrl --at-marker done --format png --out captures/done.png
   termctrl save --format png --out captures/startup.png -- my-terminal-app";
 
 const START_HELP: &str = "\
@@ -76,18 +79,28 @@ Examples:
   termctrl send demo --pace-ms 35 'text:Write a terminal haiku.' enter";
 
 const VIDEO_HELP: &str = "\
-Replay a recording produced by `session start --record` into a video artifact. Output is sampled at --fps and
-begins at the first visible terminal content while preserving real timing afterward. Pass
---include-startup to include blank startup/negotiation frames or --max-idle-ms when you explicitly
-want to shorten long quiet gaps for a condensed edit. The source `.termctrl` file retains observed
-timing, terminal bytes, client input, and automatic host input until the session is closed.
-Video export requires `ffmpeg` to be installed.
+Replay a recording produced by `termctrl start --record` into a video artifact. Without `--edit`,
+the video preserves observed timing. For a concise annotated demo, add named moments while recording
+with `termctrl mark`, then pass an edit-plan JSON file with `--edit`. Each clip selects a marker range
+and may set `speed`, `hold_ms`, or a visible `caption`.
+
+`--fps` controls the maximum sampled frame rate; identical rendered screens are rasterized once and
+reused. Pass `--include-startup` to retain blank startup or capability negotiation frames. The source
+`.termctrl` file always retains the original timing, terminal bytes, client input, automatic host
+input, and markers until the session is closed. Video export requires `ffmpeg` to be installed.
 
 Example:
   termctrl start demo --record captures/demo.termctrl -- opencode
+  termctrl mark demo before-connect
   termctrl send demo text:/connect enter
+  termctrl mark demo after-connect
   termctrl stop demo
-  termctrl video captures/demo.termctrl --out captures/demo.mp4";
+  termctrl markers captures/demo.termctrl
+  termctrl video captures/demo.termctrl --edit captures/demo.json --out captures/demo.mp4";
+
+const MARKERS_HELP: &str = "\
+List named markers from a .termctrl recording. Use the timestamps to audit an edit plan, or inspect
+screens with `termctrl show --recording FILE --at-marker NAME` before exporting a demo video.";
 
 const DRIVER_HELP: &str = "\
 Driver mode serves isolated embedded sessions as newline-delimited JSON over standard input and
@@ -133,6 +146,11 @@ enum Command {
     List(ListArgs),
     /// Resize a named live session.
     Resize(ResizeArgs),
+    /// Add a named moment to an active recording for later editing.
+    Mark(MarkArgs),
+    /// List named moments in a recording.
+    #[command(after_help = MARKERS_HELP)]
+    Markers(MarkersArgs),
     /// Print retained readable terminal output or exact ANSI/VT bytes.
     Logs(LogsArgs),
     /// Restart a named session, reusing launch settings by default.
@@ -191,6 +209,15 @@ struct SourceArgs {
     /// Render ANSI/VT bytes from this file; use `-` for stdin.
     #[arg(long, value_name = "FILE")]
     input: Option<PathBuf>,
+    /// Replay a .termctrl recording instead of reading a live session or command.
+    #[arg(long, value_name = "FILE")]
+    recording: Option<PathBuf>,
+    /// Replay a recording up to this named marker.
+    #[arg(long, requires = "recording", conflicts_with = "at_ms")]
+    at_marker: Option<String>,
+    /// Replay a recording up to this timestamp in milliseconds.
+    #[arg(long, requires = "recording")]
+    at_ms: Option<u64>,
     /// Color environment policy for a command source (default: auto for PTY, always for pipe).
     #[arg(long, value_enum)]
     color: Option<ColorMode>,
@@ -345,6 +372,23 @@ struct ResizeArgs {
 }
 
 #[derive(Args)]
+struct MarkArgs {
+    /// Name of a running session started with --record.
+    name: String,
+    /// Unique marker name referenced by video edit plans.
+    marker: String,
+}
+
+#[derive(Args)]
+struct MarkersArgs {
+    /// Recording created by `termctrl start --record`.
+    input: PathBuf,
+    /// Write structured JSON marker entries.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
 struct LogsArgs {
     /// Name of a running or inspectable exited session.
     name: String,
@@ -414,7 +458,7 @@ struct ServeArgs {
 
 #[derive(Args)]
 struct VideoArgs {
-    /// Recording created by `session start --record`.
+    /// Recording created by `termctrl start --record`.
     input: PathBuf,
     /// Override the recorded terminal cell width in rendered pixels.
     #[arg(long)]
@@ -443,9 +487,9 @@ struct VideoArgs {
     /// Maximum sampled frames per second (1 to 1000).
     #[arg(long, default_value_t = 20)]
     fps: u32,
-    /// Optionally collapse longer gaps between changed screens to this duration.
+    /// Marker-based JSON edit plan with clips, captions, speeds, and holds.
     #[arg(long)]
-    max_idle_ms: Option<u64>,
+    edit: Option<PathBuf>,
     /// Hold the final frame for this duration.
     #[arg(long, default_value_t = 1000)]
     tail_ms: u64,
@@ -518,6 +562,8 @@ fn main() -> Result<()> {
                 args.cell_height,
             )?;
         }
+        Command::Mark(args) => session::mark(&args.name, args.marker)?,
+        Command::Markers(args) => markers(args)?,
         Command::Logs(args) => logs(args)?,
         Command::Restart(args) => {
             restart_session(&args)?;
@@ -537,9 +583,9 @@ fn main() -> Result<()> {
                     pixel_ratio: args.pixel_ratio,
                     hide_cursor: args.hide_cursor,
                     fps: args.fps,
-                    max_idle: args.max_idle_ms.map(Duration::from_millis),
                     tail: Duration::from_millis(args.tail_ms),
                     include_startup: args.include_startup,
+                    edit: args.edit,
                 },
             )?;
             println!("{}", out.display());
@@ -596,6 +642,32 @@ fn read_source(args: &SourceArgs, render: &RenderArgs) -> Result<shot_engine::Sh
         args.deadline_ms
             .unwrap_or(defaults.deadline.as_millis() as u64),
     );
+    if let Some(path) = args.recording.as_ref() {
+        if args.name.is_some()
+            || args.pipe
+            || args.input.is_some()
+            || !args.command.is_empty()
+            || args.cols.is_some()
+            || args.rows.is_some()
+            || args.color.is_some()
+            || args.settle_ms.is_some()
+            || args.deadline_ms.is_some()
+            || args.initial_delay_ms.is_some()
+            || args.wait_for.is_some()
+            || args.max_bytes.is_some()
+            || args.cwd.is_some()
+            || args.host.is_some()
+            || !args.send.is_empty()
+        {
+            bail!(
+                "--recording can only be combined with rendering options, --at-marker, or --at-ms"
+            );
+        }
+        return recording::shot_at(path, args.at_ms, args.at_marker.as_deref());
+    }
+    if args.at_marker.is_some() || args.at_ms.is_some() {
+        bail!("--at-marker and --at-ms require --recording");
+    }
     if args.input.is_some() && (args.pipe || args.name.is_some() || !args.command.is_empty()) {
         bail!("--input cannot be combined with --pipe, NAME, or a command");
     }
@@ -769,6 +841,18 @@ fn logs(args: LogsArgs) -> Result<()> {
         io::stdout()
             .write_all(b"\n")
             .context("write session logs newline")?;
+    }
+    Ok(())
+}
+
+fn markers(args: MarkersArgs) -> Result<()> {
+    let markers = recording::markers(&recording::read(&args.input)?);
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&markers)?);
+        return Ok(());
+    }
+    for marker in markers {
+        println!("{}\t{}", marker.at_ms, marker.name);
     }
     Ok(())
 }
@@ -1060,6 +1144,8 @@ mod tests {
             .is_ok()
         );
         assert!(Cli::try_parse_from(["termctrl", "send", "demo", "--stdin"]).is_ok());
+        assert!(Cli::try_parse_from(["termctrl", "mark", "demo", "before-send"]).is_ok());
+        assert!(Cli::try_parse_from(["termctrl", "markers", "captures/demo.termctrl"]).is_ok());
         assert!(Cli::try_parse_from(["termctrl", "logs", "demo", "--ansi"]).is_ok());
         assert!(Cli::try_parse_from(["termctrl", "restart", "demo"]).is_ok());
         assert!(
@@ -1079,6 +1165,28 @@ mod tests {
             show(args).unwrap_err().to_string(),
             "show does not support PNG output; use save --format png --out PATH"
         );
+    }
+
+    #[test]
+    fn parses_recording_source_seek_options() {
+        let cli = Cli::try_parse_from([
+            "termctrl",
+            "show",
+            "--recording",
+            "captures/demo.termctrl",
+            "--at-marker",
+            "done",
+        ])
+        .unwrap();
+        let Command::Show(args) = cli.command else {
+            panic!("expected show command");
+        };
+
+        assert_eq!(
+            args.source.recording.as_deref(),
+            Some(Path::new("captures/demo.termctrl"))
+        );
+        assert_eq!(args.source.at_marker.as_deref(), Some("done"));
     }
 
     #[test]

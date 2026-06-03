@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -7,8 +8,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::frame::{Frame, from_screen};
+use crate::frame::{Attributes, Cell, Frame, from_screen};
 use crate::render;
+use crate::shot::Shot;
 
 const MAX_VIDEO_FPS: u32 = 1000;
 /// Schema version written in the header of every `.termctrl` recording.
@@ -42,10 +44,14 @@ pub enum Entry {
         cell_width: u16,
         cell_height: u16,
     },
+    Marker {
+        at_ms: u64,
+        name: String,
+    },
 }
 
 /// Source of bytes written to the application while recording a session.
-#[derive(Clone, Copy, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum InputOrigin {
     Client,
@@ -137,6 +143,16 @@ impl Writer {
         })
     }
 
+    pub fn marker(&mut self, name: &str) -> Result<()> {
+        if name.is_empty() {
+            bail!("marker name must not be empty");
+        }
+        self.write(Entry::Marker {
+            at_ms: self.started.elapsed().as_millis() as u64,
+            name: name.to_owned(),
+        })
+    }
+
     fn write(&mut self, entry: Entry) -> Result<()> {
         serde_json::to_writer(&mut self.file, &entry).context("write recording event")?;
         self.file
@@ -155,9 +171,9 @@ pub struct VideoOptions {
     pub pixel_ratio: f32,
     pub hide_cursor: bool,
     pub fps: u32,
-    pub max_idle: Option<Duration>,
     pub tail: Duration,
     pub include_startup: bool,
+    pub edit: Option<PathBuf>,
 }
 
 pub fn video(path: &Path, options: &VideoOptions) -> Result<()> {
@@ -173,7 +189,11 @@ pub fn video(path: &Path, options: &VideoOptions) -> Result<()> {
     if states.is_empty() {
         bail!("recording contains no visible output frames");
     }
-    let frames = common_canvas(samples(states, options));
+    let states = match &options.edit {
+        Some(path) => edited_states(states, &recording.events, &read_edit(path)?)?,
+        None => states.to_vec(),
+    };
+    let samples = samples(&states, options);
     if let Some(parent) = options
         .out
         .parent()
@@ -196,7 +216,7 @@ pub fn video(path: &Path, options: &VideoOptions) -> Result<()> {
         fs::set_permissions(&temp, fs::Permissions::from_mode(0o700))
             .with_context(|| format!("secure {}", temp.display()))?;
     }
-    let result = render_video_frames(&temp, &recording, &frames, options);
+    let result = render_video_frames(&temp, &recording, &states, &samples, options);
     let _ = fs::remove_dir_all(&temp);
     result
 }
@@ -208,6 +228,12 @@ pub struct Recording {
     pub cell_width: u16,
     pub cell_height: u16,
     pub events: Vec<Entry>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Marker {
+    pub at_ms: u64,
+    pub name: String,
 }
 
 /// Read and validate a versioned `.termctrl` JSON Lines recording.
@@ -254,14 +280,50 @@ pub fn read(path: &Path) -> Result<Recording> {
     })
 }
 
+pub fn markers(recording: &Recording) -> Vec<Marker> {
+    marker_entries(&recording.events).collect()
+}
+
+pub fn shot_at(path: &Path, at_ms: Option<u64>, marker: Option<&str>) -> Result<Shot> {
+    let recording = read(path)?;
+    let at_ms = match (at_ms, marker) {
+        (Some(_), Some(_)) => bail!("use --at-ms or --at-marker, not both"),
+        (Some(at_ms), None) => at_ms,
+        (None, Some(marker)) => *marker_times(&recording.events)?
+            .get(marker)
+            .with_context(|| format!("recording does not contain marker {marker:?}"))?,
+        (None, None) => u64::MAX,
+    };
+    let replay = replay(&recording, Some(at_ms));
+    Ok(Shot {
+        frame: replay
+            .frames
+            .last()
+            .expect("replay always has an initial frame")
+            .frame
+            .clone(),
+        ansi: replay.ansi,
+    })
+}
+
+#[derive(Clone)]
 struct VideoFrame {
     at_ms: u64,
     frame: Frame,
 }
 
+struct Replay {
+    ansi: Vec<u8>,
+    frames: Vec<VideoFrame>,
+}
+
 fn states(recording: &Recording) -> Vec<VideoFrame> {
+    replay(recording, None).frames
+}
+
+fn replay(recording: &Recording, cutoff: Option<u64>) -> Replay {
     let mut parser = crate::shot::terminal(recording.rows, recording.cols);
-    let mut output = Vec::new();
+    let mut ansi = Vec::new();
     let mut frames: Vec<VideoFrame> = Vec::new();
     frames.push(VideoFrame {
         at_ms: 0,
@@ -270,18 +332,24 @@ fn states(recording: &Recording) -> Vec<VideoFrame> {
     for event in &recording.events {
         let at_ms = match event {
             Entry::Output { at_ms, bytes } => {
-                output.extend_from_slice(bytes);
+                if cutoff.is_some_and(|cutoff| *at_ms > cutoff) {
+                    continue;
+                }
+                ansi.extend_from_slice(bytes);
                 parser.process(bytes);
                 *at_ms
             }
             Entry::Resize {
                 at_ms, cols, rows, ..
             } => {
+                if cutoff.is_some_and(|cutoff| *at_ms > cutoff) {
+                    continue;
+                }
                 parser = crate::shot::terminal(*rows, *cols);
-                parser.process(&output);
+                parser.process(&ansi);
                 *at_ms
             }
-            Entry::Input { .. } | Entry::Header { .. } => continue,
+            Entry::Input { .. } | Entry::Marker { .. } | Entry::Header { .. } => continue,
         };
         let frame = from_screen(parser.screen());
         if frames
@@ -292,17 +360,7 @@ fn states(recording: &Recording) -> Vec<VideoFrame> {
         }
         frames.push(VideoFrame { at_ms, frame });
     }
-    frames
-}
-
-fn common_canvas(mut frames: Vec<Frame>) -> Vec<Frame> {
-    let cols = frames.iter().map(|frame| frame.cols).max().unwrap_or(0);
-    let rows = frames.iter().map(|frame| frame.rows).max().unwrap_or(0);
-    for frame in &mut frames {
-        frame.cols = cols;
-        frame.rows = rows;
-    }
-    frames
+    Replay { ansi, frames }
 }
 
 fn visible_states(states: &[VideoFrame], include_startup: bool) -> &[VideoFrame] {
@@ -325,18 +383,173 @@ fn has_non_whitespace_text(frame: &Frame) -> bool {
     frame.cells.iter().any(|cell| !cell.text.trim().is_empty())
 }
 
-fn samples(states: &[VideoFrame], options: &VideoOptions) -> Vec<Frame> {
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VideoEdit {
+    clips: Vec<VideoEditClip>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VideoEditClip {
+    from: String,
+    to: String,
+    caption: Option<String>,
+    speed: Option<f64>,
+    hold_ms: Option<u64>,
+}
+
+fn read_edit(path: &Path) -> Result<VideoEdit> {
+    let edit = serde_json::from_slice(
+        &fs::read(path).with_context(|| format!("read {}", path.display()))?,
+    )
+    .with_context(|| format!("parse {}", path.display()))?;
+    validate_edit(&edit)?;
+    Ok(edit)
+}
+
+fn validate_edit(edit: &VideoEdit) -> Result<()> {
+    if edit.clips.is_empty() {
+        bail!("video edit must contain at least one clip");
+    }
+    for clip in &edit.clips {
+        if clip.from.is_empty() || clip.to.is_empty() {
+            bail!("video edit clip markers must not be empty");
+        }
+        if clip
+            .caption
+            .as_ref()
+            .is_some_and(|caption| caption.chars().count() > 1000)
+        {
+            bail!("video edit clip caption must not exceed 1000 characters");
+        }
+    }
+    Ok(())
+}
+
+fn edited_states(
+    states: &[VideoFrame],
+    entries: &[Entry],
+    edit: &VideoEdit,
+) -> Result<Vec<VideoFrame>> {
+    validate_edit(edit)?;
+    let markers = marker_times(entries)?;
+    let mut output = Vec::new();
+    let mut offset = 0_u64;
+    for clip in &edit.clips {
+        let from = *markers
+            .get(&clip.from)
+            .with_context(|| format!("video edit references missing marker {:?}", clip.from))?;
+        let to = *markers
+            .get(&clip.to)
+            .with_context(|| format!("video edit references missing marker {:?}", clip.to))?;
+        if from > to {
+            bail!("video edit clip {:?} ends before it starts", clip.from);
+        }
+        let speed = clip.speed.unwrap_or(1.0);
+        if !speed.is_finite() || speed <= 0.0 {
+            bail!(
+                "video edit clip {:?} speed must be greater than zero",
+                clip.from
+            );
+        }
+        let clip_start = offset;
+        let first = states
+            .iter()
+            .rfind(|state| state.at_ms <= from)
+            .or_else(|| states.first())
+            .context("video edit has no visible screen state")?;
+        output.push(VideoFrame {
+            at_ms: offset,
+            frame: annotate(first.frame.clone(), clip.caption.as_deref()),
+        });
+        output.extend(
+            states
+                .iter()
+                .filter(|state| state.at_ms > from && state.at_ms <= to)
+                .map(|state| VideoFrame {
+                    at_ms: scale_clip_time(clip_start, from, state.at_ms, speed),
+                    frame: annotate(state.frame.clone(), clip.caption.as_deref()),
+                }),
+        );
+        let hold_ms = clip.hold_ms.unwrap_or(0);
+        offset = scale_clip_time(clip_start, from, to, speed).saturating_add(hold_ms);
+        if hold_ms > 0
+            && let Some(last) = output.last()
+        {
+            output.push(VideoFrame {
+                at_ms: offset,
+                frame: last.frame.clone(),
+            });
+        }
+    }
+    Ok(output)
+}
+
+fn scale_clip_time(clip_start: u64, from: u64, at_ms: u64, speed: f64) -> u64 {
+    clip_start + ((at_ms.saturating_sub(from) as f64) / speed) as u64
+}
+
+fn marker_times(entries: &[Entry]) -> Result<HashMap<String, u64>> {
+    let mut markers = HashMap::new();
+    for marker in marker_entries(entries) {
+        if markers.insert(marker.name.clone(), marker.at_ms).is_some() {
+            bail!("recording contains duplicate marker {:?}", marker.name);
+        }
+    }
+    Ok(markers)
+}
+
+fn marker_entries(entries: &[Entry]) -> impl Iterator<Item = Marker> + '_ {
+    entries.iter().filter_map(|entry| match entry {
+        Entry::Marker { at_ms, name } => Some(Marker {
+            at_ms: *at_ms,
+            name: name.clone(),
+        }),
+        _ => None,
+    })
+}
+
+fn annotate(mut frame: Frame, caption: Option<&str>) -> Frame {
+    let Some(caption) = caption else {
+        return frame;
+    };
+    let text: String = ['>', ' ']
+        .into_iter()
+        .chain(caption.chars())
+        .take(usize::from(frame.cols.saturating_sub(2)))
+        .collect();
+    if text.is_empty() {
+        return frame;
+    }
+    let y = frame.rows;
+    let width = text.chars().count().min(usize::from(u16::MAX)) as u16;
+    frame.rows = frame.rows.saturating_add(2);
+    frame.cells.push(Cell {
+        x: 1,
+        y,
+        text,
+        width,
+        foreground: frame.foreground,
+        background: frame.background,
+        attributes: Attributes {
+            bold: true,
+            ..Attributes::default()
+        },
+    });
+    frame
+}
+
+fn samples(states: &[VideoFrame], options: &VideoOptions) -> Vec<usize> {
     if states.is_empty() {
         return Vec::new();
     }
     let mut timeline = Vec::with_capacity(states.len());
     let mut at_ms = 0_u64;
-    for (index, state) in states.iter().enumerate() {
+    for index in 0..states.len() {
         timeline.push(at_ms);
         if let Some(next) = states.get(index + 1) {
-            let gap = Duration::from_millis(next.at_ms.saturating_sub(state.at_ms));
-            let gap = options.max_idle.map_or(gap, |max| gap.min(max));
-            at_ms = at_ms.saturating_add(gap.as_millis() as u64);
+            at_ms = at_ms.saturating_add(next.at_ms.saturating_sub(states[index].at_ms));
         }
     }
     let end_ms = at_ms.saturating_add(options.tail.as_millis() as u64);
@@ -352,11 +565,11 @@ fn samples(states: &[VideoFrame], options: &VideoOptions) -> Vec<Frame> {
         while state + 1 < timeline.len() && timeline[state + 1] <= sample_ms {
             state += 1;
         }
-        output.push(states[state].frame.clone());
+        output.push(state);
         sample += 1;
     }
-    if output.last() != states.last().map(|state| &state.frame) {
-        output.push(states.last().expect("non-empty states").frame.clone());
+    if output.last() != Some(&(states.len() - 1)) {
+        output.push(states.len() - 1);
     }
     output
 }
@@ -364,14 +577,37 @@ fn samples(states: &[VideoFrame], options: &VideoOptions) -> Vec<Frame> {
 fn render_video_frames(
     temp: &Path,
     recording: &Recording,
-    frames: &[Frame],
+    states: &[VideoFrame],
+    samples: &[usize],
     options: &VideoOptions,
 ) -> Result<()> {
-    for (index, frame) in frames.iter().enumerate() {
+    eprintln!("Rendering {} sampled frames...", samples.len());
+    let cols = states
+        .iter()
+        .map(|state| state.frame.cols)
+        .max()
+        .unwrap_or(recording.cols);
+    let rows = states
+        .iter()
+        .map(|state| state.frame.rows)
+        .max()
+        .unwrap_or(recording.rows);
+    let keys = states
+        .iter()
+        .map(|state| render_key(&state.frame, cols, rows, options.hide_cursor))
+        .collect::<Vec<_>>();
+    let mut rendered = HashMap::<Frame, PathBuf>::new();
+    let renderer = render::PngRenderer::new();
+    for (index, state) in samples.iter().enumerate() {
         let path = temp.join(format!("frame-{index:06}.png"));
-        render::png(
+        let key = &keys[*state];
+        if let Some(existing) = rendered.get(key) {
+            fs::hard_link(existing, &path).or_else(|_| fs::copy(existing, &path).map(|_| ()))?;
+            continue;
+        }
+        renderer.render(
             &render::svg(
-                frame,
+                key,
                 &render::Options {
                     cell_width: f32::from(options.cell_width.unwrap_or(recording.cell_width)),
                     cell_height: f32::from(options.cell_height.unwrap_or(recording.cell_height)),
@@ -385,7 +621,10 @@ fn render_video_frames(
             &path,
             options.pixel_ratio,
         )?;
+        rendered.insert(key.clone(), path);
     }
+    eprintln!("Rendered {} unique screens.", rendered.len());
+    eprintln!("Encoding {}...", options.out.display());
     let status = Command::new("ffmpeg")
         .args(["-y", "-loglevel", "error", "-framerate"])
         .arg(options.fps.to_string())
@@ -401,6 +640,16 @@ fn render_video_frames(
     Ok(())
 }
 
+fn render_key(frame: &Frame, cols: u16, rows: u16, hide_cursor: bool) -> Frame {
+    let mut frame = frame.clone();
+    frame.cols = cols;
+    frame.rows = rows;
+    if hide_cursor {
+        frame.cursor = None;
+    }
+    frame
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -408,7 +657,7 @@ mod tests {
     fn frame(text: &str) -> Frame {
         Frame {
             version: 1,
-            cols: 2,
+            cols: 40,
             rows: 1,
             foreground: crate::frame::DEFAULT_FOREGROUND,
             background: crate::frame::DEFAULT_BACKGROUND,
@@ -438,9 +687,21 @@ mod tests {
             pixel_ratio: 1.0,
             hide_cursor: true,
             fps: 20,
-            max_idle: None,
             tail: Duration::ZERO,
             include_startup: false,
+            edit: None,
+        }
+    }
+
+    fn edit(from: &str, to: &str) -> VideoEdit {
+        VideoEdit {
+            clips: vec![VideoEditClip {
+                from: from.to_owned(),
+                to: to.to_owned(),
+                caption: None,
+                speed: None,
+                hold_ms: None,
+            }],
         }
     }
 
@@ -451,11 +712,9 @@ mod tests {
     }
 
     #[test]
-    fn idle_compression_caps_sampled_frame_duration() {
+    fn realtime_sampling_preserves_recorded_duration() {
         let initial = frame("a");
         let final_frame = frame("b");
-        let mut options = options();
-        options.max_idle = Some(Duration::from_millis(500));
 
         let frames = samples(
             &[
@@ -468,11 +727,88 @@ mod tests {
                     frame: final_frame.clone(),
                 },
             ],
-            &options,
+            &options(),
         );
 
-        assert_eq!(frames.len(), 11);
-        assert_eq!(frames.last(), Some(&final_frame));
+        assert_eq!(frames.len(), 81);
+        assert_eq!(frames.last(), Some(&1));
+    }
+
+    #[test]
+    fn edit_plan_stitches_marker_ranges_with_speed_hold_and_caption() {
+        let first = frame("a");
+        let second = frame("b");
+        let states = edited_states(
+            &[
+                VideoFrame {
+                    at_ms: 0,
+                    frame: first.clone(),
+                },
+                VideoFrame {
+                    at_ms: 1000,
+                    frame: second.clone(),
+                },
+                VideoFrame {
+                    at_ms: 2000,
+                    frame: first.clone(),
+                },
+            ],
+            &[
+                Entry::Marker {
+                    at_ms: 0,
+                    name: "start".to_owned(),
+                },
+                Entry::Marker {
+                    at_ms: 2000,
+                    name: "done".to_owned(),
+                },
+            ],
+            &VideoEdit {
+                clips: vec![VideoEditClip {
+                    from: "start".to_owned(),
+                    to: "done".to_owned(),
+                    caption: Some("accelerated".to_owned()),
+                    speed: Some(2.0),
+                    hold_ms: Some(500),
+                }],
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            states.iter().map(|state| state.at_ms).collect::<Vec<_>>(),
+            [0, 500, 1000, 1500]
+        );
+        assert_eq!(states[0].frame.rows, 3);
+        assert!(states[0].frame.text().contains("accelerated"));
+        assert_eq!(states.last().unwrap().frame.text(), states[2].frame.text());
+    }
+
+    #[test]
+    fn edit_plan_rejects_missing_or_duplicate_markers() {
+        let states = [VideoFrame {
+            at_ms: 0,
+            frame: frame("a"),
+        }];
+
+        assert!(edited_states(&states, &[], &edit("missing", "done")).is_err());
+        assert!(
+            edited_states(
+                &states,
+                &[
+                    Entry::Marker {
+                        at_ms: 0,
+                        name: "start".to_owned(),
+                    },
+                    Entry::Marker {
+                        at_ms: 1,
+                        name: "start".to_owned(),
+                    },
+                ],
+                &edit("start", "start"),
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -482,6 +818,7 @@ mod tests {
         let mut writer = Writer::new(&temp, Instant::now(), 2, 1, 9, 18).unwrap();
         writer.output(1, &[0, 255, b'A']).unwrap();
         writer.input(InputOrigin::Host, b"reply").unwrap();
+        writer.marker("checkpoint").unwrap();
         drop(writer);
 
         let recording = read(&temp).unwrap();
@@ -493,6 +830,10 @@ mod tests {
         assert!(matches!(
             &recording.events[1],
             Entry::Input { origin: InputOrigin::Host, bytes, .. } if bytes == b"reply"
+        ));
+        assert!(matches!(
+            &recording.events[2],
+            Entry::Marker { name, .. } if name == "checkpoint"
         ));
     }
 
@@ -518,7 +859,13 @@ mod tests {
             ],
         };
 
-        let frames = common_canvas(samples(&states(&recording), &options()));
+        let states = states(&recording);
+        let cols = states.iter().map(|state| state.frame.cols).max().unwrap();
+        let rows = states.iter().map(|state| state.frame.rows).max().unwrap();
+        let frames = states
+            .iter()
+            .map(|state| render_key(&state.frame, cols, rows, true))
+            .collect::<Vec<_>>();
 
         assert!(
             frames
@@ -563,7 +910,7 @@ mod tests {
             &options(),
         );
 
-        assert_eq!(frames, vec![initial, final_frame]);
+        assert_eq!(frames, vec![0, 1]);
     }
 
     #[test]
@@ -587,10 +934,7 @@ mod tests {
             &options,
         );
 
-        assert_eq!(
-            frames,
-            vec![initial.clone(), initial.clone(), initial, final_frame]
-        );
+        assert_eq!(frames, vec![0, 0, 0, 1]);
     }
 
     #[test]

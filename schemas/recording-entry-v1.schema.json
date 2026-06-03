@@ -7,7 +7,8 @@
     { "$ref": "#/$defs/header" },
     { "$ref": "#/$defs/output" },
     { "$ref": "#/$defs/input" },
-    { "$ref": "#/$defs/resize" }
+    { "$ref": "#/$defs/resize" },
+    { "$ref": "#/$defs/marker" }
   ],
   "$defs": {
     "dimension": { "type": "integer", "minimum": 0, "maximum": 65535 },
@@ -61,6 +62,16 @@
         "rows": { "$ref": "#/$defs/terminalDimension" },
         "cell_width": { "$ref": "#/$defs/dimension" },
         "cell_height": { "$ref": "#/$defs/dimension" }
+      }
+    },
+    "marker": {
+      "type": "object",
+      "required": ["type", "at_ms", "name"],
+      "additionalProperties": false,
+      "properties": {
+        "type": { "const": "marker" },
+        "at_ms": { "type": "integer", "minimum": 0 },
+        "name": { "type": "string", "minLength": 1 }
       }
     }
   }

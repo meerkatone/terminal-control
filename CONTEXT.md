@@ -22,7 +22,9 @@ A versioned JSON Lines stdin/stdout adapter over embedded sessions for external 
 
 ### Recording
 
-A timestamped terminal event timeline containing output, client or automatic host input, and viewport resize events. A recording can be rendered to video and should be treated as potentially sensitive.
+A timestamped terminal event timeline containing output, client or automatic host input, viewport resize events, and named editing markers. A recording can be rendered directly to a realtime video that preserves observed timing or rendered through an explicit edit plan that stitches marker ranges with clip-specific speed, holds, and captions. The source recording remains unchanged and should be treated as potentially sensitive.
+
+Agents inspect marker names with `termctrl markers` and inspect exact recording moments with `termctrl show --recording ... --at-marker ...` or `--at-ms ...` before committing to a video edit plan.
 
 ### ANSI/VT Stream
 

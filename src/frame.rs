@@ -4,7 +4,7 @@ use vt100::{Color as TerminalColor, Screen};
 /// Schema version written in every structured terminal frame.
 pub const FORMAT_VERSION: u8 = 1;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Deserialize, Serialize)]
 pub struct Color {
     pub r: u8,
     pub g: u8,
@@ -28,7 +28,7 @@ impl Color {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Deserialize, Serialize)]
 pub struct Attributes {
     pub bold: bool,
     pub italic: bool,
@@ -39,13 +39,13 @@ pub struct Attributes {
     pub underline: Option<Underline>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Underline {
     Single,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Deserialize, Serialize)]
 pub struct Cell {
     pub x: u16,
     pub y: u16,
@@ -56,7 +56,7 @@ pub struct Cell {
     pub attributes: Attributes,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Deserialize, Serialize)]
 pub struct Cursor {
     pub x: u16,
     pub y: u16,
@@ -64,7 +64,7 @@ pub struct Cursor {
     pub blinking: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Deserialize, Serialize)]
 pub struct Frame {
     pub version: u8,
     pub cols: u16,

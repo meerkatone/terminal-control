@@ -116,15 +116,37 @@ Record a session timeline and replay it as an MP4:
 termctrl start demo --record captures/demo.termctrl \
   --host opentui --cols 112 --rows 34 -- opencode
 termctrl wait demo "Ask anything"
+termctrl mark demo before-prompt
 termctrl send demo --pace-ms 35 'text:Write a short terminal haiku. End with the uppercase form of done.' enter
 termctrl wait demo "DONE" --timeout 60000
+termctrl mark demo after-answer
 termctrl save demo --format png --out captures/answer.png
 termctrl stop demo
 
-termctrl video captures/demo.termctrl --hide-cursor --out captures/demo.mp4
+termctrl markers captures/demo.termctrl
+termctrl show --recording captures/demo.termctrl --at-marker after-answer
+termctrl video captures/demo.termctrl --edit captures/demo.json --hide-cursor --out captures/demo.mp4
 ```
 
-Video export trims startup frames before non-whitespace text by default, while still preserving recordings that only paint terminal backgrounds. Use `--include-startup` to keep all startup frames, or `--max-idle-ms 600` to intentionally shorten quiet gaps.
+The marker-based edit plan is explicit and deterministic:
+
+```json
+{
+  "clips": [
+    {
+      "from": "before-prompt",
+      "to": "after-answer",
+      "speed": 4,
+      "hold_ms": 1200,
+      "caption": "The agent answers inside the live terminal UI"
+    }
+  ]
+}
+```
+
+Without `--edit`, video export preserves the observed recording timing. Edit plans are preferable for polished demos because they select intentional marker ranges and can accelerate animated spinner spans without relying on visual-idle heuristics. Identical rendered screens are rasterized once and reused during export. Video export trims startup frames before non-whitespace text by default while still preserving recordings that only paint terminal backgrounds; use `--include-startup` to keep all startup frames.
+
+Use `termctrl markers captures/demo.termctrl` to audit available marker names and timestamps. Use `termctrl show --recording captures/demo.termctrl --at-marker after-answer` or `--at-ms 1234` to inspect exact screens while tuning an edit plan.
 
 Recordings are JSON Lines files containing terminal output, client input, and automatic host input; they can include prompts or secrets. Treat them as sensitive artifacts.
 

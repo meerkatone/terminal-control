@@ -456,6 +456,16 @@ impl Session {
         Ok(())
     }
 
+    /// Add a named moment to the active recording timeline.
+    pub fn mark(&mut self, name: &str) -> Result<()> {
+        self.consume_batch()?;
+        let recording = self
+            .recording
+            .as_mut()
+            .context("session was not started with --record")?;
+        recording.marker(name)
+    }
+
     /// Terminate the application owned by this session.
     pub fn stop(&mut self) -> Result<()> {
         self.terminate();
@@ -636,6 +646,9 @@ enum Request {
         cell_width: Option<u16>,
         cell_height: Option<u16>,
     },
+    Mark {
+        name: String,
+    },
     Stop,
 }
 
@@ -732,6 +745,12 @@ pub fn resize(
             cell_height,
         },
     )?;
+    Ok(())
+}
+
+#[doc(hidden)]
+pub fn mark(name: &str, marker: String) -> Result<()> {
+    request(name, Request::Mark { name: marker })?;
     Ok(())
 }
 
@@ -1213,6 +1232,7 @@ mod implementation {
                     cell_height.unwrap_or(status.cell_height),
                 )?;
             }
+            Request::Mark { name } => session.mark(&name)?,
             Request::Stop => session.stop()?,
         }
         Ok(response)
