@@ -1,5 +1,7 @@
 # @kitlangton/terminal-control-darwin-x64
 
+## 0.3.0
+
 ## 0.2.0
 
 ### Minor Changes
