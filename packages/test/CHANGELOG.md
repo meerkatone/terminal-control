@@ -1,5 +1,11 @@
 # @kitlangton/terminal-control
 
+## 0.3.1
+
+### Patch Changes
+
+- Refresh dependencies and make retained-output byte-limit checks overflow-safe.
+
 ## 0.3.0
 
 ### Minor Changes
