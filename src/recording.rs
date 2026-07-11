@@ -502,8 +502,18 @@ fn edited_states(
                     footer_caption: footer_caption(clip.caption.as_deref(), caption_placement),
                 }),
         );
+        let clip_end = scale_clip_time(clip_start, from, to, speed);
+        if output.last().is_some_and(|last| last.at_ms < clip_end)
+            && let Some(last) = output.last()
+        {
+            output.push(VideoFrame {
+                at_ms: clip_end,
+                frame: last.frame.clone(),
+                footer_caption: last.footer_caption.clone(),
+            });
+        }
         let hold_ms = clip.hold_ms.unwrap_or(0);
-        offset = scale_clip_time(clip_start, from, to, speed).saturating_add(hold_ms);
+        offset = clip_end.saturating_add(hold_ms);
         if hold_ms > 0
             && let Some(last) = output.last()
         {
@@ -971,6 +981,43 @@ mod tests {
         assert_eq!(states[0].frame.rows, 3);
         assert!(states[0].frame.text().contains("accelerated"));
         assert_eq!(states.last().unwrap().frame.text(), states[2].frame.text());
+    }
+
+    #[test]
+    fn edit_plan_preserves_quiet_time_before_clip_end() {
+        let states = edited_states(
+            &[
+                VideoFrame {
+                    at_ms: 0,
+                    frame: frame("a"),
+                    footer_caption: None,
+                },
+                VideoFrame {
+                    at_ms: 1000,
+                    frame: frame("b"),
+                    footer_caption: None,
+                },
+            ],
+            &[
+                Entry::Marker {
+                    at_ms: 0,
+                    name: "start".to_owned(),
+                },
+                Entry::Marker {
+                    at_ms: 2000,
+                    name: "done".to_owned(),
+                },
+            ],
+            &edit("start", "done"),
+            CaptionPlacement::Inline,
+        )
+        .unwrap();
+
+        assert_eq!(
+            states.iter().map(|state| state.at_ms).collect::<Vec<_>>(),
+            [0, 1000, 2000]
+        );
+        assert_eq!(states[1].frame, states[2].frame);
     }
 
     #[test]
