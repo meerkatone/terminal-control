@@ -4,6 +4,8 @@ use anyhow::{Context, Result};
 
 use crate::frame::{Cell, Frame, Underline};
 
+mod box_drawing;
+
 #[derive(Clone, Debug)]
 pub struct Options {
     pub cell_width: f32,
@@ -194,6 +196,14 @@ fn graphic(cell: &Cell, options: &Options) -> Option<String> {
             width.min(height) * 0.09,
         ));
     }
+    if let Some(rects) = box_drawing::rects(char, width, height) {
+        return Some(
+            rects
+                .into_iter()
+                .map(|rect| single(rect.left, rect.top, rect.width, rect.height))
+                .collect(),
+        );
+    }
     Some(match char {
         '█' => single(0.0, 0.0, 1.0, 1.0),
         '▀' => single(0.0, 0.0, 1.0, 0.5),
@@ -381,6 +391,84 @@ mod tests {
 
         assert!(output.contains("height=\"9\""));
         assert!(!output.contains(">▀</text>"));
+    }
+
+    #[test]
+    fn renders_horizontal_box_drawing_as_contiguous_geometry() {
+        let frame = Frame {
+            version: 1,
+            cols: 2,
+            rows: 1,
+            foreground: Color {
+                r: 166,
+                g: 184,
+                b: 255,
+            },
+            background: Color { r: 0, g: 0, b: 0 },
+            cursor: None,
+            cells: ["━", "━"]
+                .into_iter()
+                .enumerate()
+                .map(|(x, text)| crate::frame::Cell {
+                    x: x as u16,
+                    y: 0,
+                    text: text.to_owned(),
+                    width: 1,
+                    foreground: Color {
+                        r: 166,
+                        g: 184,
+                        b: 255,
+                    },
+                    background: Color { r: 0, g: 0, b: 0 },
+                    attributes: Attributes::default(),
+                })
+                .collect(),
+        };
+
+        let output = svg(&frame, &Options::default());
+
+        assert!(!output.contains(">━</text>"));
+        assert_eq!(output.matches("<rect").count(), 3);
+    }
+
+    #[test]
+    fn renders_opencode_box_drawing_as_geometry() {
+        let glyphs = ["│", "┃", "╹", "┌", "┐", "└", "┘", "├", "┤", "┬", "┴", "┼"];
+        let frame = Frame {
+            version: 1,
+            cols: glyphs.len() as u16,
+            rows: 1,
+            foreground: Color {
+                r: 166,
+                g: 184,
+                b: 255,
+            },
+            background: Color { r: 0, g: 0, b: 0 },
+            cursor: None,
+            cells: glyphs
+                .into_iter()
+                .enumerate()
+                .map(|(x, text)| crate::frame::Cell {
+                    x: x as u16,
+                    y: 0,
+                    text: text.to_owned(),
+                    width: 1,
+                    foreground: Color {
+                        r: 166,
+                        g: 184,
+                        b: 255,
+                    },
+                    background: Color { r: 0, g: 0, b: 0 },
+                    attributes: Attributes::default(),
+                })
+                .collect(),
+        };
+
+        let output = svg(&frame, &Options::default());
+
+        for glyph in glyphs {
+            assert!(!output.contains(&format!(">{glyph}</text>")));
+        }
     }
 
     #[test]
