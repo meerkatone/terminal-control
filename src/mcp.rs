@@ -26,8 +26,12 @@ struct SessionName {
 struct ScreenRequest {
     name: String,
     #[serde(default)]
+    #[schemars(
+        description = "Optional quiet period before returning; omit for an immediate snapshot"
+    )]
     settle_ms: u64,
     #[serde(default)]
+    #[schemars(description = "Maximum optional settling wait; omit for an immediate snapshot")]
     deadline_ms: u64,
 }
 
@@ -54,9 +58,13 @@ struct InteractRequest {
     wait_for: Option<String>,
     #[serde(default = "default_timeout_ms")]
     timeout_ms: u64,
-    #[serde(default = "default_settle_ms")]
+    #[serde(default)]
+    #[schemars(
+        description = "Optional quiet period before returning; omit for an immediate snapshot"
+    )]
     settle_ms: u64,
-    #[serde(default = "default_deadline_ms")]
+    #[serde(default)]
+    #[schemars(description = "Maximum optional settling wait; omit for an immediate snapshot")]
     deadline_ms: u64,
 }
 
@@ -394,14 +402,6 @@ fn format_error(error: anyhow::Error) -> String {
     format!("{error:#}")
 }
 
-const fn default_settle_ms() -> u64 {
-    100
-}
-
-const fn default_deadline_ms() -> u64 {
-    5_000
-}
-
 const fn default_timeout_ms() -> u64 {
     5_000
 }
@@ -428,14 +428,21 @@ mod tests {
     }
 
     #[test]
-    fn screen_requests_default_to_an_immediate_snapshot() {
-        let request: ScreenRequest = serde_json::from_value(serde_json::json!({
+    fn screen_and_interact_requests_default_to_an_immediate_snapshot() {
+        let screen: ScreenRequest = serde_json::from_value(serde_json::json!({
             "name": "editor"
         }))
         .unwrap();
+        let interact: InteractRequest = serde_json::from_value(serde_json::json!({
+            "name": "editor",
+            "input": []
+        }))
+        .unwrap();
 
-        assert_eq!(request.settle_ms, 0);
-        assert_eq!(request.deadline_ms, 0);
+        assert_eq!(screen.settle_ms, 0);
+        assert_eq!(screen.deadline_ms, 0);
+        assert_eq!(interact.settle_ms, 0);
+        assert_eq!(interact.deadline_ms, 0);
     }
 
     #[test]
@@ -501,6 +508,27 @@ mod tests {
             "logsTruncated",
         ] {
             assert!(properties.get(field).is_some(), "missing {field}");
+        }
+    }
+
+    #[test]
+    fn publishes_settling_as_optional_and_immediate_by_default() {
+        let tools = TerminalControl::tool_router().list_all();
+
+        for name in ["get_screen", "interact"] {
+            let tool = tools
+                .iter()
+                .find(|tool| tool.name.as_ref() == name)
+                .unwrap();
+            let schema = serde_json::to_value(&tool.input_schema).unwrap();
+            let required = schema["required"].as_array().unwrap();
+
+            for field in ["settleMs", "deadlineMs"] {
+                let property = &schema["properties"][field];
+                assert_eq!(property["default"], 0);
+                assert!(property["description"].as_str().unwrap().contains("omit"));
+                assert!(!required.iter().any(|value| value == field));
+            }
         }
     }
 

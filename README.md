@@ -38,6 +38,9 @@ Or expose sessions as structured MCP tools instead of shell commands (stdio serv
 termctrl mcp
 ```
 
+MCP screen reads and interactions return the current frame immediately. Agents can opt into
+quiet-output settling with `settleMs` and `deadlineMs` when a specific transition requires it.
+
 Then ask for terminal work in ordinary language:
 
 ```text
