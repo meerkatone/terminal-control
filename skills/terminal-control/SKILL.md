@@ -1,6 +1,6 @@
 ---
 name: terminal-control
-description: Control and test terminal applications with the termctrl CLI by reading visible screen state, driving named live sessions, sending typed keyboard input, waiting for text, collecting explicit evidence, recording timelines, marking important moments, and exporting edited videos. Use when an agent must operate or verify a TUI, REPL, interactive CLI, shell process, OpenTUI application, or other terminal-backed workflow.
+description: Drive and verify terminal applications with the termctrl CLI in a real PTY - read visible screens, run named live sessions, send typed keyboard input, wait for text, save evidence, record timelines, and export edited videos. Use when an agent must operate or test a TUI, REPL, interactive CLI, shell process, or OpenTUI application.
 ---
 
 # Terminal Control
@@ -37,10 +37,8 @@ termctrl run -- /usr/bin/nvim
 termctrl run editor -- nvim
 ```
 
-The form without `NAME` uses the executable basename (`nvim`) and fails if that session name is
-invalid or already in use; it never chooses a suffixed name. Pass an explicit name when running
-multiple copies or when the executable basename is unsuitable. `status` reports the original
-command and effective cwd for both forms.
+The form without `NAME` uses the executable basename (`nvim`) and fails on a name collision; it
+never chooses a suffixed name. Pass an explicit name when running multiple copies.
 
 ## Choose The Correct Observation
 

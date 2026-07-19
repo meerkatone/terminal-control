@@ -2,7 +2,7 @@
 
 Typed terminal application control and testing client for `termctrl driver`, with stable screen snapshots, keyboard interaction, readable logs, recordings, and opt-in failure evidence.
 
-Install the package with Vitest after the initial npm publication:
+Install the package alongside Vitest:
 
 ```bash
 bun add -d @kitlangton/terminal-control vitest
@@ -26,4 +26,4 @@ await session.screen.waitForText("Ready")
 expect(await session.screen.text()).toMatchSnapshot()
 ```
 
-For line-oriented output, use `session.logs.text()`; for exact ANSI/VT bytes, use `session.transcript.ansi()`. Artifact and recording configuration is opt-in because terminal output and input may contain secrets. See the repository `README.md` for the complete workflow.
+For line-oriented output, use `session.logs.text()`; for exact ANSI/VT bytes, use `session.transcript.ansi()`. Artifact and recording configuration is opt-in because terminal output and input may contain secrets. See the [full client documentation](https://github.com/anomalyco/terminal-control/blob/main/docs/typescript-client.md) for the complete workflow.

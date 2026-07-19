@@ -3,7 +3,7 @@
 ## Repository
 
 - Terminal Control is a Rust library and its `termctrl` CLI binary. Public CLI vocabulary is `show` for reading visible terminal state, `save` for explicit retained artifacts, a named `session` for the live terminal lifecycle managed by flat control commands, `logs` for readable retained output, and `video` for a recorded timeline export.
-- Keep `README.md` and the Clap help in `src/main.rs` aligned when changing commands, formats, sessions, recording, or OpenTUI support.
+- Keep `README.md`, `skills/terminal-control/SKILL.md`, and the Clap help in `src/main.rs` aligned when changing commands, formats, sessions, recording, or OpenTUI support. Deep-dive documentation lives in `docs/` (`rust-library.md`, `driver-protocol.md`, `typescript-client.md`, `releasing.md`); the README stays install- and example-first with short pointers.
 - Prefer focused fixes with unit tests in the affected module.
 
 ## Validation
