@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/kitlangton/terminal-control/schemas/video-edit-v1.schema.json",
+  "$id": "https://github.com/anomalyco/terminal-control/schemas/video-edit-v1.schema.json",
   "title": "Terminal Control video edit plan v1",
   "description": "Selects named marker ranges from a .termctrl recording and stitches them into an annotated demo video.",
   "type": "object",

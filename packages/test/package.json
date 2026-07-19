@@ -5,7 +5,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/kitlangton/terminal-control.git",
+    "url": "https://github.com/anomalyco/terminal-control.git",
     "directory": "packages/test"
   },
   "type": "module",

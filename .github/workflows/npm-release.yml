@@ -33,7 +33,7 @@ jobs:
           toolchain: "1.93"
       - uses: actions/setup-node@v6
         with:
-          node-version: 22
+          node-version: 24
       - run: cargo build --release
       - run: node scripts/native-packages.mjs "${{ matrix.package }}" "$PWD/target/release/termctrl" "$PWD/npm-artifacts"
       - uses: actions/upload-artifact@v7
@@ -48,7 +48,7 @@ jobs:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v6
         with:
-          node-version: 22
+          node-version: 24
       - uses: oven-sh/setup-bun@v2
       - run: bun install --frozen-lockfile
       - run: bun run --cwd packages/test typecheck
@@ -77,7 +77,7 @@ jobs:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v6
         with:
-          node-version: 22
+          node-version: 24
       - uses: oven-sh/setup-bun@v2
       - uses: actions/download-artifact@v8
         with:
@@ -99,7 +99,7 @@ jobs:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v6
         with:
-          node-version: 22
+          node-version: 24
           registry-url: https://registry.npmjs.org
       - run: npm install --global npm@latest
       - uses: actions/download-artifact@v8

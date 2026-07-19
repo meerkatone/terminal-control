@@ -3,7 +3,7 @@
   "version": "0.3.1",
   "description": "Native termctrl binary for Terminal Control on macOS x64",
   "license": "MIT",
-  "repository": "https://github.com/kitlangton/terminal-control",
+  "repository": "https://github.com/anomalyco/terminal-control",
   "os": [
     "darwin"
   ],

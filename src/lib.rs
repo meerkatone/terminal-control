@@ -11,6 +11,7 @@
 
 pub mod driver;
 pub mod frame;
+pub mod mcp;
 pub mod recording;
 pub mod render;
 pub mod session;

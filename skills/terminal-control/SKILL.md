@@ -29,6 +29,19 @@ termctrl stop app
 
 Always stop named sessions after use unless the user explicitly wants the live process retained.
 
+Keep an application visible and human-controlled in the current terminal pane while exposing the
+same session controls to agents:
+
+```bash
+termctrl run -- /usr/bin/nvim
+termctrl run editor -- nvim
+```
+
+The form without `NAME` uses the executable basename (`nvim`) and fails if that session name is
+invalid or already in use; it never chooses a suffixed name. Pass an explicit name when running
+multiple copies or when the executable basename is unsuitable. `status` reports the original
+command and effective cwd for both forms.
+
 ## Choose The Correct Observation
 
 - Use `show` for current visible screen text. Prefer it for reasoning about full-screen TUIs.
@@ -94,5 +107,6 @@ Treat `.termctrl` recordings, ANSI transcripts, screen artifacts, command argume
 
 - Run `termctrl status app` to inspect state and launch settings.
 - Run `termctrl list` to discover retained named sessions.
+- MCP agents can use `list_sessions` for command/cwd discovery and `get_session_status({ name })` for complete structured status without parsing CLI output.
 - If a session socket path is too long, set `TERMCTRL_RUNTIME_DIR` to a short private directory under `/tmp` before starting sessions.
 - If `termctrl` is unavailable, install Terminal Control with `cargo install terminal-control` or ask the user which installed binary to use.

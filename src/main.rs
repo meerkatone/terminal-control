@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use terminal_control::{driver, recording, render, session, shot as shot_engine};
+use terminal_control::{driver, mcp, recording, render, session, shot as shot_engine};
 
 const HELP: &str = "\
 termctrl controls and captures terminal applications for agents and tests. Start a named live
@@ -16,6 +16,7 @@ Examples:
   termctrl show -- my-terminal-app
   termctrl save --format png --out captures/app.png -- my-terminal-app
   termctrl start demo --host opentui -- opencode
+  termctrl run editor -- nvim
   termctrl wait demo '/connect' && termctrl send demo text:/connect enter
   termctrl show demo
   termctrl save demo --format png --out captures/provider.png
@@ -63,6 +64,18 @@ Example:
   termctrl show demo
   termctrl save demo --format png --out captures/provider.png
   termctrl stop demo";
+
+const RUN_HELP: &str = "\
+Run starts a PTY session in the foreground and mirrors it through the current terminal. Omit NAME
+to use the executable basename as the session name. Inferred names must be valid session names and
+must not collide with an existing session.
+The application remains directly visible and interactive in this terminal pane while agents use
+the same named-session commands to inspect its screen, send input, and resize it. The application
+exits with this foreground command; no terminal multiplexer or terminal-specific API is required.
+
+Examples:
+  termctrl run editor --cwd ~/src/project -- nvim
+  termctrl run -- /usr/bin/nvim";
 
 const SEND_HELP: &str = "\
 Send ordered input to a live session. Text uses `text:<value>`; named keys include `enter`,
@@ -150,6 +163,9 @@ enum Command {
     /// Start a named persistent terminal application.
     #[command(after_help = START_HELP)]
     Start(StartArgs),
+    /// Run a named, agent-controllable application visibly in this terminal.
+    #[command(after_help = RUN_HELP)]
+    Run(RunArgs),
     /// Wait until a named session includes visible text.
     Wait(WaitArgs),
     /// Send ordered input to a named session.
@@ -179,6 +195,8 @@ enum Command {
     /// Serve isolated sessions for external testing clients.
     #[command(after_help = DRIVER_HELP)]
     Driver,
+    /// Serve named Terminal Control sessions as MCP tools over stdio.
+    Mcp,
     #[command(name = "__serve", hide = true)]
     Serve(ServeArgs),
 }
@@ -324,6 +342,43 @@ struct StartArgs {
     host: Option<HostProfile>,
     /// Command and arguments to launch, following `--`.
     #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+    command: Vec<String>,
+}
+
+#[derive(Args)]
+struct RunArgs {
+    /// Stable local name used by later session commands; defaults to the executable basename.
+    #[arg(value_name = "NAME")]
+    name: Option<String>,
+    /// Terminal width in cells when terminal dimensions cannot be detected.
+    #[arg(long, default_value_t = 80)]
+    cols: u16,
+    /// Terminal height in cells when terminal dimensions cannot be detected.
+    #[arg(long, default_value_t = 24)]
+    rows: u16,
+    /// Terminal cell width in pixels.
+    #[arg(long, default_value_t = 9)]
+    cell_width: u16,
+    /// Terminal cell height in pixels.
+    #[arg(long, default_value_t = 18)]
+    cell_height: u16,
+    /// Maximum raw terminal bytes retained by the live session.
+    #[arg(long, default_value_t = 16 * 1024 * 1024)]
+    max_bytes: usize,
+    /// Working directory for the terminal command.
+    #[arg(long)]
+    cwd: Option<PathBuf>,
+    /// Write timestamped terminal output and client/host input to this private recording file.
+    #[arg(long)]
+    record: Option<PathBuf>,
+    /// Color environment policy for the terminal command.
+    #[arg(long, value_enum, default_value = "auto")]
+    color: ColorMode,
+    /// Terminal-host compatibility response profile.
+    #[arg(long, value_enum)]
+    host: Option<HostProfile>,
+    /// Command and arguments to launch, following `--`.
+    #[arg(last = true, num_args = 1.., allow_hyphen_values = true)]
     command: Vec<String>,
 }
 
@@ -565,6 +620,7 @@ fn main() -> Result<()> {
             start_session(&args)?;
             println!("{}", args.name);
         }
+        Command::Run(args) => run_session(&args)?,
         Command::Wait(args) => {
             session::wait(&args.name, args.text, Duration::from_millis(args.timeout))?;
         }
@@ -612,6 +668,9 @@ fn main() -> Result<()> {
         }
         Command::Driver => {
             driver::serve(BufReader::new(io::stdin().lock()), io::stdout().lock())?;
+        }
+        Command::Mcp => {
+            tokio::runtime::Runtime::new()?.block_on(mcp::serve())?;
         }
         Command::Serve(args) => {
             session::serve(
@@ -904,6 +963,31 @@ fn start_session(args: &StartArgs) -> Result<()> {
     )
 }
 
+fn run_session(args: &RunArgs) -> Result<()> {
+    let name = match args.name.as_deref() {
+        Some(name) => name.to_owned(),
+        None => session::infer_name(&args.command)?,
+    };
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((args.cols, args.rows));
+    validate_terminal_size(cols, rows)?;
+    session::run_foreground(
+        &name,
+        &args.command,
+        args.cwd.as_deref(),
+        args.record.as_deref(),
+        &shot_engine::Options {
+            cols,
+            rows,
+            cell_width: args.cell_width,
+            cell_height: args.cell_height,
+            max_bytes: args.max_bytes,
+            opentui_host: matches!(args.host, Some(HostProfile::Opentui)),
+            color: args.color.into(),
+            ..shot_engine::Options::default()
+        },
+    )
+}
+
 fn restart_session(args: &RestartArgs) -> Result<()> {
     let previous = session::status(&args.name)?.launch;
     let cols = args.cols.unwrap_or(previous.cols);
@@ -1156,6 +1240,7 @@ mod tests {
 
     #[test]
     fn parses_flat_session_control_commands() {
+        assert!(Cli::try_parse_from(["termctrl", "run", "editor", "--", "nvim", "."]).is_ok());
         assert!(Cli::try_parse_from(["termctrl", "status", "demo", "--json"]).is_ok());
         assert!(
             Cli::try_parse_from([
@@ -1171,6 +1256,38 @@ mod tests {
         assert!(
             Cli::try_parse_from(["termctrl", "wait", "demo", "ready", "--timeout", "5"]).is_ok()
         );
+    }
+
+    #[test]
+    fn parses_foreground_run_with_an_inferred_name() {
+        let cli = Cli::try_parse_from([
+            "termctrl",
+            "run",
+            "--cwd",
+            "/tmp",
+            "--",
+            "/usr/bin/nvim",
+            "file.txt",
+        ])
+        .unwrap();
+        let Command::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+
+        assert_eq!(args.name, None);
+        assert_eq!(args.command, ["/usr/bin/nvim", "file.txt"]);
+        assert_eq!(args.cwd.as_deref(), Some(Path::new("/tmp")));
+    }
+
+    #[test]
+    fn preserves_explicit_foreground_run_names() {
+        let cli = Cli::try_parse_from(["termctrl", "run", "editor", "--", "nvim"]).unwrap();
+        let Command::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+
+        assert_eq!(args.name.as_deref(), Some("editor"));
+        assert_eq!(args.command, ["nvim"]);
     }
 
     #[test]

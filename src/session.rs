@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
@@ -50,6 +50,7 @@ pub struct Session {
     cell_width: u16,
     cell_height: u16,
     launch: SessionLaunch,
+    mirror: Option<Box<dyn Write + Send>>,
 }
 
 /// Lifecycle state of a running or completed session.
@@ -259,7 +260,13 @@ impl Session {
                 opentui_host: options.opentui_host,
                 color: options.color,
             },
+            mirror: None,
         })
+    }
+
+    /// Mirror subsequent PTY output to another terminal-facing writer.
+    pub fn mirror_to(&mut self, writer: impl Write + Send + 'static) {
+        self.mirror = Some(Box::new(writer));
     }
 
     /// Send one input burst to the terminal application.
@@ -567,6 +574,12 @@ impl Session {
     }
 
     fn apply_output(&mut self, output: Output) -> Result<()> {
+        if let Some(mirror) = &mut self.mirror {
+            mirror
+                .write_all(&output.bytes)
+                .context("mirror PTY output")?;
+            mirror.flush().context("flush mirrored PTY output")?;
+        }
         if let Some(recording) = &mut self.recording {
             recording.output(output.at_ms, &output.bytes)?;
         }
@@ -783,6 +796,40 @@ pub fn serve(
     implementation::serve(socket, command, cwd, record, options)
 }
 
+/// Run a named session in the foreground, mirrored through the current terminal.
+pub fn run_foreground(
+    name: &str,
+    command: &[String],
+    cwd: Option<&Path>,
+    record: Option<&Path>,
+    options: &Options,
+) -> Result<()> {
+    validate_name(name)?;
+    implementation::run_foreground(name, command, cwd, record, options)
+}
+
+#[doc(hidden)]
+pub fn infer_name(command: &[String]) -> Result<String> {
+    let executable = command.first().ok_or_else(|| {
+        anyhow::anyhow!("cannot infer a session name: provide a command after --")
+    })?;
+    let name = Path::new(executable)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "cannot infer a session name from executable {executable:?}: basename is empty or invalid"
+            )
+        })?;
+    validate_name(name).map_err(|error| {
+        anyhow::anyhow!(
+            "cannot infer a session name from executable {executable:?}: basename {name:?} is invalid: {error}"
+        )
+    })?;
+    Ok(name.to_owned())
+}
+
 fn request(name: &str, request: Request) -> Result<Response> {
     validate_name(name)?;
     let response = implementation::request(socket_path(name)?, &request)?;
@@ -824,6 +871,7 @@ mod implementation {
 
     use super::{NamedSessionStatus, Request, Response, Session, UnavailableReason};
     use crate::shot::{self, Options};
+    use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 
     const MAX_REQUEST_BYTES: u64 = 1024 * 1024;
     const CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
@@ -1099,6 +1147,92 @@ mod implementation {
         result
     }
 
+    struct RawMode;
+
+    impl RawMode {
+        fn enter() -> Result<Self> {
+            enable_raw_mode().context("enable terminal raw mode")?;
+            Ok(Self)
+        }
+    }
+
+    impl Drop for RawMode {
+        fn drop(&mut self) {
+            let _ = disable_raw_mode();
+        }
+    }
+
+    pub fn run_foreground(
+        name: &str,
+        command: &[String],
+        cwd: Option<&Path>,
+        record: Option<&Path>,
+        options: &Options,
+    ) -> Result<()> {
+        if command.is_empty() {
+            bail!("provide a command after --");
+        }
+        let runtime = runtime_dir()?;
+        let socket = runtime.join(format!("{name}.sock"));
+        ensure_socket_path(&socket)?;
+        let _lock = StartLock::acquire(&runtime.join(format!("{name}.lock")))?;
+        if socket.exists() {
+            if request(socket.clone(), &Request::Ping).is_ok() {
+                bail!("session {name:?} is already running");
+            }
+            fs::remove_file(&socket)
+                .with_context(|| format!("remove stale {}", socket.display()))?;
+        }
+        let result = (|| {
+            let listener = UnixListener::bind(&socket)
+                .with_context(|| format!("bind {}", socket.display()))?;
+            fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("secure {}", socket.display()))?;
+            listener.set_nonblocking(true)?;
+            let mut session = Session::start(command, cwd, record, options)?;
+            session.mirror_to(std::io::stdout());
+            let (input_send, input_receive) = std::sync::mpsc::channel::<Vec<u8>>();
+            thread::spawn(move || {
+                let mut stdin = std::io::stdin().lock();
+                let mut bytes = [0_u8; 1024];
+                while let Ok(length) = stdin.read(&mut bytes) {
+                    if length == 0 || input_send.send(bytes[..length].to_vec()).is_err() {
+                        break;
+                    }
+                }
+            });
+            let _raw = RawMode::enter()?;
+            loop {
+                session.consume_batch()?;
+                while let Ok(input) = input_receive.try_recv() {
+                    session.send(&input)?;
+                }
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        if handle(stream, &mut session)? {
+                            break;
+                        }
+                    }
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+                    Err(error) => return Err(error).context("accept session request"),
+                }
+                if session.status()?.state == super::SessionState::Exited {
+                    break;
+                }
+                if let Ok((cols, rows)) = crossterm::terminal::size() {
+                    let status = session.status()?;
+                    if cols > 0 && rows > 0 && (cols != status.cols || rows != status.rows) {
+                        session.resize(cols, rows, status.cell_width, status.cell_height)?;
+                    }
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            Ok(())
+        })();
+        let _ = fs::remove_file(&socket);
+        result
+    }
+
     fn ensure_socket_path(path: &Path) -> Result<()> {
         if path.as_os_str().as_encoded_bytes().len() >= 100 {
             bail!(
@@ -1300,6 +1434,15 @@ mod implementation {
     ) -> Result<()> {
         bail!("persistent sessions require Unix sockets")
     }
+    pub fn run_foreground(
+        _: &str,
+        _: &[String],
+        _: Option<&Path>,
+        _: Option<&Path>,
+        _: &Options,
+    ) -> Result<()> {
+        bail!("persistent sessions require Unix sockets")
+    }
 }
 
 #[cfg(test)]
@@ -1428,7 +1571,7 @@ mod tests {
     #[test]
     fn status_retains_canonical_launch_details() {
         let mut session = Session::start(
-            &["sh".to_owned(), "-c".to_owned(), "sleep 1".to_owned()],
+            &["/bin/sh".to_owned(), "-c".to_owned(), "sleep 1".to_owned()],
             Some(Path::new("/tmp")),
             None,
             &Options::default(),
@@ -1436,9 +1579,37 @@ mod tests {
         .unwrap();
 
         let status = session.status().unwrap();
-        assert_eq!(status.launch.command[0], "sh");
+        assert_eq!(status.launch.command, ["/bin/sh", "-c", "sleep 1"]);
         assert_eq!(status.launch.cwd, std::fs::canonicalize("/tmp").unwrap());
         session.stop().unwrap();
+    }
+
+    #[test]
+    fn infers_session_name_from_executable_basename() {
+        assert_eq!(infer_name(&["nvim".to_owned()]).unwrap(), "nvim");
+        assert_eq!(infer_name(&["/usr/bin/nvim".to_owned()]).unwrap(), "nvim");
+    }
+
+    #[test]
+    fn rejects_empty_or_invalid_inferred_session_names() {
+        assert!(
+            infer_name(&["/".to_owned()])
+                .unwrap_err()
+                .to_string()
+                .contains("basename is empty or invalid")
+        );
+        assert!(
+            infer_name(&["/usr/bin/my editor".to_owned()])
+                .unwrap_err()
+                .to_string()
+                .contains("basename \"my editor\" is invalid")
+        );
+        assert!(
+            infer_name(&[])
+                .unwrap_err()
+                .to_string()
+                .contains("provide a command after --")
+        );
     }
 
     #[cfg(unix)]

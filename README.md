@@ -3,9 +3,9 @@
 Control, inspect, test, and capture real terminal applications for agents and TUI review.
 
 [![crates.io](https://img.shields.io/crates/v/terminal-control.svg)](https://crates.io/crates/terminal-control)
-[![CI](https://github.com/kitlangton/terminal-control/actions/workflows/ci.yml/badge.svg)](https://github.com/kitlangton/terminal-control/actions/workflows/ci.yml)
+[![CI](https://github.com/anomalyco/terminal-control/actions/workflows/ci.yml/badge.svg)](https://github.com/anomalyco/terminal-control/actions/workflows/ci.yml)
 
-![OpenCode answering a playful terminal request](https://raw.githubusercontent.com/kitlangton/terminal-control/main/docs/screenshots/opencode-haikus.png)
+![OpenCode answering a playful terminal request](https://raw.githubusercontent.com/anomalyco/terminal-control/main/docs/screenshots/opencode-haikus.png)
 
 Saved from one live OpenCode session using `start`, `send`, and `save`.
 
@@ -23,13 +23,13 @@ termctrl --help
 Install the current repository head instead of the latest crate release:
 
 ```bash
-cargo install --locked --git https://github.com/kitlangton/terminal-control terminal-control
+cargo install --locked --git https://github.com/anomalyco/terminal-control terminal-control
 ```
 
 Install the agent skill from this repository:
 
 ```bash
-npx skills add kitlangton/terminal-control --skill terminal-control
+npx skills add anomalyco/terminal-control --skill terminal-control
 ```
 
 Then ask your agent for terminal work in ordinary language:
@@ -52,6 +52,8 @@ The skill teaches agents the safe workflow: start named sessions, wait for visib
 
 - Real PTY control for TUIs, shells, curses apps, OpenTUI apps, and long-running CLIs.
 - Named background sessions so an agent can keep multiple terminals alive and switch between them.
+- Foreground named sessions that remain visible and human-controlled in any terminal pane while agents share control.
+- A native MCP stdio server for structured, shell-free session discovery, input, waiting, capture, resizing, and stopping.
 - Visible-screen reads through `show`, not brittle scraping of scrollback or logs.
 - Exact keyboard and text input with `send`, including arrows, tabs, enter, escape, page keys, and `ctrl-a` through `ctrl-z`.
 - Explicit waits for rendered text before interacting.
@@ -78,6 +80,7 @@ Drive a persistent TUI session:
 
 ```bash
 termctrl start demo --host opentui --cols 112 --rows 34 -- opencode
+termctrl run -- nvim
 termctrl wait demo "Ask anything" --timeout 20000
 termctrl send demo --pace-ms 35 'text:Write a terminal haiku.' enter
 termctrl show demo
@@ -111,7 +114,7 @@ termctrl --help
 Install the current repository head instead of the latest crate release:
 
 ```bash
-cargo install --locked --git https://github.com/kitlangton/terminal-control terminal-control
+cargo install --locked --git https://github.com/anomalyco/terminal-control terminal-control
 ```
 
 ## Show A Terminal Screen
@@ -172,6 +175,15 @@ termctrl stop demo
 ```
 
 `status` reports `running` or `exited`, the effective working directory, command, viewport, and recording path. An exited session retains its final screen for `show` until it is stopped. `list` distinguishes unavailable stale sockets from incompatible older session protocols.
+
+Run an application visibly in the current terminal while agents control the same PTY with `show`, `send`, and the other named-session commands:
+
+```bash
+termctrl run -- /usr/bin/nvim
+termctrl run editor --cwd ~/src/project -- nvim
+```
+
+`run` is a transparent foreground PTY wrapper. Your terminal input and the child application's output remain visible and interactive in that pane, while the named local control socket lets an agent inspect the screen and send input concurrently. With `termctrl run -- COMMAND`, the session name is the executable basename (`nvim` above); the command and effective cwd remain available through `status`. The basename must be a valid session name, and an existing session with that name causes a clear collision error rather than an automatically suffixed name. Pass `NAME` explicitly when the inferred name is unsuitable or already in use. It works inside any terminal emulator and does not involve tmux or another terminal multiplexer.
 
 `send` accepts `ctrl-a` through `ctrl-z`, keys such as `enter`, `escape`, arrows, `tab`, `shift-tab`, `backspace`, `delete`, `home`, `end`, `page-up`, and `page-down`, plus typed input as `text:<value>`. Use `ctrl-c` to interrupt work or pipe exact prompt bytes with `--stdin`:
 
@@ -309,6 +321,16 @@ Structured output is versioned for external tools:
 
 `session::Session` is the embedded lifecycle interface; the flat named-session CLI commands and the external driver are adapters over the same implementation.
 
+## MCP Server
+
+Expose named Terminal Control sessions to MCP clients through the official Rust MCP SDK:
+
+```bash
+termctrl mcp
+```
+
+The stdio server provides tools to list sessions, inspect structured session status and launch details, read a visible screen, send typed input, compose send/wait/capture into one interaction, resize a session, and stop a session. `list_sessions` includes each available session's command and canonical working directory; unavailable entries retain their name and reason with nullable status fields. `get_session_status({ name })` returns exit information, command and cwd, terminal and cell dimensions, idle and visible-content state, recording state and path, and log-truncation state. Paths are loss-tolerant strings so platform-native paths cannot make an MCP response fail serialization. Typed input avoids shell quoting and distinguishes text, named keys, control letters, and exact bytes. `termctrl run` remains a human-launched foreground command because an MCP server cannot create a visible terminal pane itself.
+
 ## External Driver
 
 External agent tooling can keep multiple embedded sessions alive through a versioned JSON Lines protocol over stdin/stdout:
@@ -331,7 +353,7 @@ A driver `capture` response contains a structured visible frame, derived `text`,
 
 ## TypeScript Client
 
-`@kitlangton/terminal-control` exposes the driver as isolated typed test sessions. It deliberately separates the visible screen from readable retained logs and the exact ANSI/VT transcript. Its npm distribution includes an optional native package for macOS or GNU/Linux on arm64 or x64, so consumers do not need a Rust toolchain or separate `termctrl` installation.
+`@kitlangton/terminal-control` exposes the driver as isolated typed test sessions. The source repository is now hosted at `anomalyco/terminal-control`, but the npm packages intentionally remain under the existing `@kitlangton` scope for install continuity. It deliberately separates the visible screen from readable retained logs and the exact ANSI/VT transcript. Its npm distribution includes an optional native package for macOS or GNU/Linux on arm64 or x64, so consumers do not need a Rust toolchain or separate `termctrl` installation.
 
 After the initial npm publication:
 
@@ -416,11 +438,11 @@ await session.saveRecording("artifacts/navigation.termctrl")
 
 ### npm Release
 
-The npm workspace publishes `@kitlangton/terminal-control` with fixed-version platform packages: `@kitlangton/terminal-control-darwin-arm64`, `@kitlangton/terminal-control-darwin-x64`, `@kitlangton/terminal-control-linux-arm64-gnu`, and `@kitlangton/terminal-control-linux-x64-gnu`. The client is compiled to ESM JavaScript with declarations; each native package receives the release Rust executable during the `npm release` workflow.
+The npm workspace publishes the existing `@kitlangton/terminal-control` package with fixed-version platform packages: `@kitlangton/terminal-control-darwin-arm64`, `@kitlangton/terminal-control-darwin-x64`, `@kitlangton/terminal-control-linux-arm64-gnu`, and `@kitlangton/terminal-control-linux-x64-gnu`. The client is compiled to ESM JavaScript with declarations; each native package receives the release Rust executable during the `npm release` workflow.
 
 For subsequent user-facing npm changes, create a Changeset with `bun run changeset`, commit the generated release metadata, run `bun run version-packages`, refresh `bun.lock`, and commit the versioned package metadata before running the workflow. Run the workflow with `publish: false` to assemble packages only, or `publish: true` to publish assembled tarballs after its clean Bun and Node/Vitest consumer validation passes.
 
-The publish job is prepared for npm trusted publishing through GitHub Actions OIDC. In npm package settings, configure `kitlangton/terminal-control` and workflow `npm-release.yml` as the trusted publisher for the client and each platform package before using `publish: true`.
+The publish job is prepared for npm trusted publishing through GitHub Actions OIDC. In npm package settings, configure `anomalyco/terminal-control` and workflow `npm-release.yml` as the trusted publisher for the client and each platform package before using `publish: true`.
 
 ## Notes
 
