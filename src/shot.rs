@@ -6,12 +6,11 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::frame::{DEFAULT_BACKGROUND, DEFAULT_FOREGROUND, Frame};
+use crate::terminal_core::TerminalCore;
 use anyhow::{Context, Result, bail};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
-use vt100::Parser;
-
-use crate::frame::{DEFAULT_BACKGROUND, DEFAULT_FOREGROUND, Frame, from_screen};
 
 const OPENTUI_QUERY: &[u8] = b"\x1b]10;?\x07\x1b]11;?\x07";
 const PALETTE_QUERY: &[u8] = b"\x1b]4;0;?\x07";
@@ -81,10 +80,10 @@ pub fn from_ansi(bytes: Vec<u8>, rows: u16, cols: u16, max_bytes: usize) -> Resu
     if bytes.len() > max_bytes {
         bail!("terminal input exceeds --max-bytes ({max_bytes})");
     }
-    let mut parser = terminal(rows, cols);
-    parser.process(&bytes);
+    let mut terminal = TerminalCore::new(rows, cols, 0)?;
+    let _responses = terminal.apply_output(&bytes);
     Ok(Shot {
-        frame: from_screen(parser.screen()),
+        frame: terminal.frame()?,
         ansi: bytes,
     })
 }
@@ -135,7 +134,7 @@ pub fn from_command(command: &[String], cwd: Option<&Path>, options: &Options) -
         let _ = send.send(None);
     });
     let result = (|| {
-        let mut terminal = terminal(options.rows, options.cols);
+        let mut terminal = TerminalCore::new(options.rows, options.cols, 0)?;
         let mut ansi = Vec::new();
         let mut host = Host::new(writer, options);
         let started = Instant::now();
@@ -153,7 +152,7 @@ pub fn from_command(command: &[String], cwd: Option<&Path>, options: &Options) -
             &mut clock,
         )?;
         if let Some(pattern) = options.wait_for.as_deref()
-            && !terminal.screen().contents().contains(pattern)
+            && !terminal.text()?.contains(pattern)
         {
             bail!(
                 "visible terminal did not include --wait-for {pattern:?} before command ended or deadline elapsed"
@@ -173,7 +172,7 @@ pub fn from_command(command: &[String], cwd: Option<&Path>, options: &Options) -
             )?;
         }
         Ok(Shot {
-            frame: from_screen(terminal.screen()),
+            frame: terminal.frame()?,
             ansi,
         })
     })();
@@ -234,7 +233,7 @@ pub fn from_pipe_command(
     spawn_pipe_reader(stderr, send);
 
     let result = (|| {
-        let mut terminal = terminal(options.rows, options.cols);
+        let mut terminal = TerminalCore::new(options.rows, options.cols, 0)?;
         let mut ansi = Vec::new();
         let mut normalizer = LinefeedNormalizer::default();
         let deadline = Instant::now() + options.deadline;
@@ -251,7 +250,7 @@ pub fn from_pipe_command(
                 Ok(Some(bytes)) => {
                     let bytes = normalizer.normalize(&bytes);
                     retain(&mut ansi, &bytes, options.max_bytes)?;
-                    terminal.process(&bytes);
+                    let _responses = terminal.apply_output(&bytes);
                 }
                 Ok(None) => open_streams = open_streams.saturating_sub(1),
                 Err(RecvTimeoutError::Disconnected) => open_streams = 0,
@@ -263,14 +262,14 @@ pub fn from_pipe_command(
         }
 
         if let Some(pattern) = options.wait_for.as_deref()
-            && !terminal.screen().contents().contains(pattern)
+            && !terminal.text()?.contains(pattern)
         {
             bail!(
                 "visible terminal did not include --wait-for {pattern:?} before command ended or deadline elapsed"
             );
         }
         Ok(Shot {
-            frame: from_screen(terminal.screen()),
+            frame: terminal.frame()?,
             ansi,
         })
     })();
@@ -376,10 +375,6 @@ fn configure_process_environment(builder: &mut ProcessCommand, options: &Options
     builder.envs(&options.env);
 }
 
-pub(crate) fn terminal(rows: u16, cols: u16) -> Parser {
-    Parser::new(rows, cols, 0)
-}
-
 pub(crate) fn validate_geometry(rows: u16, cols: u16) -> Result<()> {
     if rows == 0 || cols == 0 {
         bail!("terminal dimensions must be greater than zero");
@@ -389,7 +384,7 @@ pub(crate) fn validate_geometry(rows: u16, cols: u16) -> Result<()> {
 
 fn consume_until_ready(
     receive: &mpsc::Receiver<Option<Vec<u8>>>,
-    terminal: &mut Parser,
+    terminal: &mut TerminalCore,
     ansi: &mut Vec<u8>,
     host: &mut Host,
     options: &Options,
@@ -404,10 +399,7 @@ fn consume_until_ready(
         );
     }
     if let Some(pattern) = &options.wait_for {
-        while !closed
-            && Instant::now() < clock.deadline
-            && !terminal.screen().contents().contains(pattern)
-        {
+        while !closed && Instant::now() < clock.deadline && !terminal.text()?.contains(pattern) {
             closed = matches!(
                 receive_chunk(receive, terminal, ansi, host, options.max_bytes, clock)?,
                 Chunk::Closed
@@ -438,7 +430,7 @@ struct Clock {
 
 fn receive_chunk(
     receive: &mpsc::Receiver<Option<Vec<u8>>>,
-    terminal: &mut Parser,
+    terminal: &mut TerminalCore,
     ansi: &mut Vec<u8>,
     host: &mut Host,
     max_bytes: usize,
@@ -453,9 +445,8 @@ fn receive_chunk(
     }
     match receive.recv_timeout(timeout) {
         Ok(Some(bytes)) => {
-            host.respond(&bytes)?;
             retain(ansi, &bytes, max_bytes)?;
-            terminal.process(&bytes);
+            respond_to_output(terminal, host, &bytes)?;
             clock.last_output = Some(Instant::now());
             Ok(Chunk::Output)
         }
@@ -464,9 +455,25 @@ fn receive_chunk(
     }
 }
 
+pub(crate) fn respond_to_output(
+    terminal: &mut TerminalCore,
+    host: &mut Host,
+    output: &[u8],
+) -> Result<Vec<u8>> {
+    let ghostty_response = terminal.apply_output(output);
+    if host.is_enabled() {
+        host.respond(output)
+    } else {
+        if !ghostty_response.is_empty() {
+            host.send(&ghostty_response)?;
+        }
+        Ok(ghostty_response)
+    }
+}
+
 fn consume_until_settled(
     receive: &mpsc::Receiver<Option<Vec<u8>>>,
-    terminal: &mut Parser,
+    terminal: &mut TerminalCore,
     ansi: &mut Vec<u8>,
     host: &mut Host,
     options: &Options,
@@ -533,6 +540,10 @@ impl Host {
             .write_all(input)
             .context("send terminal input")?;
         self.writer.flush().context("flush terminal input")
+    }
+
+    pub(crate) fn is_enabled(&self) -> bool {
+        self.enabled
     }
 
     pub(crate) fn resize(&mut self, cols: u16, rows: u16, cell_width: u16, cell_height: u16) {
@@ -723,9 +734,62 @@ mod tests {
     }
 
     #[test]
+    fn opentui_host_does_not_duplicate_ghostty_responses() {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let mut host = Host::new(
+            Box::new(Writer(Arc::clone(&written))),
+            &Options {
+                opentui_host: true,
+                ..Options::default()
+            },
+        );
+        let mut terminal = TerminalCore::new(24, 80, 0).unwrap();
+
+        let response = respond_to_output(&mut terminal, &mut host, OPENTUI_QUERY).unwrap();
+        let foreground_responses = response
+            .windows(b"\x1b]10;".len())
+            .filter(|window| *window == b"\x1b]10;")
+            .count();
+
+        assert_eq!(foreground_responses, 1);
+        assert_eq!(*written.lock().unwrap(), response);
+    }
+
+    #[test]
     fn rejects_zero_terminal_geometry_before_parsing() {
         assert!(from_ansi(Vec::new(), 0, 1, 1).is_err());
         assert!(from_ansi(Vec::new(), 1, 0, 1).is_err());
+    }
+
+    #[test]
+    fn ghostty_ansi_shots_preserve_frame_v1_colors_and_attributes() {
+        let shot = from_ansi(
+            b"\x1b[1;3;4;38;5;214;48;2;30;34;42mwide: ".to_vec(),
+            2,
+            20,
+            1024,
+        )
+        .unwrap();
+
+        assert_eq!(shot.frame.text(), "wide:");
+        assert_eq!(
+            shot.frame.cells[0].foreground,
+            crate::frame::indexed_color(214)
+        );
+        assert_eq!(
+            shot.frame.cells[0].background,
+            crate::frame::Color {
+                r: 30,
+                g: 34,
+                b: 42,
+            }
+        );
+        assert!(shot.frame.cells[0].attributes.bold);
+        assert!(shot.frame.cells[0].attributes.italic);
+        assert_eq!(
+            shot.frame.cells[0].attributes.underline,
+            Some(crate::frame::Underline::Single)
+        );
     }
 
     #[test]

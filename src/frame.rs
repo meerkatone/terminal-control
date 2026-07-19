@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use vt100::{Color as TerminalColor, Screen};
 
 /// Schema version written in every structured terminal frame.
 pub const FORMAT_VERSION: u8 = 1;
@@ -77,16 +76,21 @@ pub struct Frame {
 
 impl Frame {
     pub fn has_visible_content(&self) -> bool {
-        self.cells
-            .iter()
-            .any(|cell| !cell.text.trim().is_empty() || cell.background != self.background)
+        self.cells.iter().any(|cell| {
+            (!cell.attributes.invisible && !cell.text.trim().is_empty())
+                || cell.background != self.background
+        })
     }
 
     pub fn text(&self) -> String {
         let mut rows =
             vec![vec![String::from(" "); usize::from(self.cols)]; usize::from(self.rows)];
         for cell in &self.cells {
-            if cell.text.is_empty() || cell.x >= self.cols || cell.y >= self.rows {
+            if cell.text.is_empty()
+                || cell.attributes.invisible
+                || cell.x >= self.cols
+                || cell.y >= self.rows
+            {
                 continue;
             }
             rows[usize::from(cell.y)][usize::from(cell.x)] = cell.text.clone();
@@ -103,77 +107,7 @@ impl Frame {
     }
 }
 
-pub fn from_screen(screen: &Screen) -> Frame {
-    let (rows, cols) = screen.size();
-    let foreground = DEFAULT_FOREGROUND;
-    let background = DEFAULT_BACKGROUND;
-    let mut cells = Vec::new();
-    for y in 0..rows {
-        for x in 0..cols {
-            let Some(cell) = screen.cell(y, x) else {
-                continue;
-            };
-            if cell.is_wide_continuation() {
-                continue;
-            }
-            let mut cell_foreground = resolve_color(cell.fgcolor(), foreground);
-            let mut cell_background = resolve_color(cell.bgcolor(), background);
-            if cell.inverse() {
-                std::mem::swap(&mut cell_foreground, &mut cell_background);
-            }
-            let attributes = Attributes {
-                bold: cell.bold(),
-                italic: cell.italic(),
-                faint: cell.dim(),
-                invisible: false,
-                strikethrough: false,
-                overline: false,
-                underline: cell.underline().then_some(Underline::Single),
-            };
-            let text = cell.contents().to_owned();
-            if !text.is_empty() || cell_background != background || has_attributes(&attributes) {
-                cells.push(Cell {
-                    x,
-                    y,
-                    text,
-                    width: if cell.is_wide() { 2 } else { 1 },
-                    foreground: cell_foreground,
-                    background: cell_background,
-                    attributes,
-                });
-            }
-        }
-    }
-    let (cursor_y, cursor_x) = screen.cursor_position();
-    Frame {
-        version: FORMAT_VERSION,
-        cols,
-        rows,
-        foreground,
-        background,
-        cursor: (!screen.hide_cursor()).then_some(Cursor {
-            x: cursor_x,
-            y: cursor_y,
-            color: foreground,
-            blinking: false,
-        }),
-        cells,
-    }
-}
-
-fn has_attributes(attributes: &Attributes) -> bool {
-    attributes.bold || attributes.italic || attributes.faint || attributes.underline.is_some()
-}
-
-fn resolve_color(color: TerminalColor, default: Color) -> Color {
-    match color {
-        TerminalColor::Default => default,
-        TerminalColor::Rgb(r, g, b) => Color { r, g, b },
-        TerminalColor::Idx(index) => indexed_color(index),
-    }
-}
-
-fn indexed_color(index: u8) -> Color {
+pub(crate) fn indexed_color(index: u8) -> Color {
     const ANSI: [Color; 16] = [
         Color { r: 0, g: 0, b: 0 },
         Color {
@@ -284,10 +218,14 @@ mod tests {
 
     #[test]
     fn extracts_truecolor_backgrounds_and_text() {
-        let mut parser = vt100::Parser::new(3, 20, 0);
-        parser.process(b"\x1b[48;2;30;34;42m\x1b[38;2;196;215;240m Hi \x1b[0m");
-
-        let frame = from_screen(parser.screen());
+        let frame = crate::shot::from_ansi(
+            b"\x1b[48;2;30;34;42m\x1b[38;2;196;215;240m Hi \x1b[0m".to_vec(),
+            3,
+            20,
+            1024,
+        )
+        .unwrap()
+        .frame;
 
         assert_eq!(frame.text(), " Hi");
         assert_eq!(
@@ -338,15 +276,24 @@ mod tests {
 
     #[test]
     fn background_paint_is_visible_content() {
-        let mut parser = vt100::Parser::new(1, 2, 0);
-        parser.process(b"\x1b[48;2;30;34;42m ");
+        let frame = crate::shot::from_ansi(b"\x1b[48;2;30;34;42m ".to_vec(), 1, 2, 1024)
+            .unwrap()
+            .frame;
 
-        assert!(from_screen(parser.screen()).has_visible_content());
+        assert!(frame.has_visible_content());
     }
 
     #[test]
     fn text_ignores_out_of_bounds_external_cells() {
-        let mut frame = from_screen(vt100::Parser::new(1, 1, 0).screen());
+        let mut frame = Frame {
+            version: FORMAT_VERSION,
+            cols: 1,
+            rows: 1,
+            foreground: DEFAULT_FOREGROUND,
+            background: DEFAULT_BACKGROUND,
+            cursor: None,
+            cells: Vec::new(),
+        };
         frame.cells.push(Cell {
             x: 2,
             y: 0,
@@ -358,5 +305,14 @@ mod tests {
         });
 
         assert_eq!(frame.text(), "");
+    }
+
+    #[test]
+    fn text_ignores_invisible_cells() {
+        let frame = crate::shot::from_ansi(b"\x1b[8msecret\x1b[0mvisible".to_vec(), 1, 20, 1024)
+            .unwrap()
+            .frame;
+
+        assert_eq!(frame.text(), "      visible");
     }
 }

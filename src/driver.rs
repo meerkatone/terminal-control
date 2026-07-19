@@ -4,12 +4,11 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -230,58 +229,115 @@ struct ResizeParams {
     cell_height: Option<u16>,
 }
 
+type SessionOperation = Box<dyn FnOnce(&mut Session) -> Result<Value> + Send>;
+
+enum WorkerRequest {
+    Call {
+        operation: SessionOperation,
+        reply: SyncSender<Result<Value>>,
+    },
+    Stop {
+        reply: SyncSender<Result<Value>>,
+    },
+}
+
 struct ManagedSession {
-    session: Arc<Mutex<Session>>,
-    stop: Arc<AtomicBool>,
-    error: Arc<Mutex<Option<String>>>,
+    send: SyncSender<WorkerRequest>,
     recording: Option<PathBuf>,
     worker: Option<thread::JoinHandle<()>>,
 }
 
 impl ManagedSession {
-    fn new(session: Session, recording: Option<PathBuf>) -> Self {
-        let session = Arc::new(Mutex::new(session));
-        let stop = Arc::new(AtomicBool::new(false));
-        let error = Arc::new(Mutex::new(None));
-        let worker_session = Arc::clone(&session);
-        let worker_stop = Arc::clone(&stop);
-        let worker_error = Arc::clone(&error);
+    fn start(
+        command: Vec<String>,
+        cwd: Option<PathBuf>,
+        recording: Option<PathBuf>,
+        options: Options,
+    ) -> Result<Self> {
+        let (send, receive) = mpsc::sync_channel(1);
+        let (started_send, started_receive) = mpsc::sync_channel(1);
+        let session_recording = recording.clone();
         let worker = thread::spawn(move || {
-            while !worker_stop.load(Ordering::Relaxed) {
-                let result = worker_session.lock().unwrap().pump();
-                if let Err(error) = result {
-                    *worker_error.lock().unwrap() = Some(format!("{error:#}"));
+            let mut session = match Session::start(
+                &command,
+                cwd.as_deref(),
+                session_recording.as_deref(),
+                &options,
+            ) {
+                Ok(session) => session,
+                Err(error) => {
+                    let _ = started_send.send(Err(error));
                     return;
                 }
-                thread::sleep(Duration::from_millis(10));
+            };
+            if started_send.send(Ok(())).is_err() {
+                return;
+            }
+            let mut pump_error = None;
+            loop {
+                if pump_error.is_none()
+                    && let Err(error) = session.pump()
+                {
+                    pump_error = Some(format!("{error:#}"));
+                }
+                match receive.recv_timeout(Duration::from_millis(10)) {
+                    Ok(WorkerRequest::Call { operation, reply }) => {
+                        let result = match &pump_error {
+                            Some(error) => Err(anyhow!("session output pump failed: {error}")),
+                            None => operation(&mut session),
+                        };
+                        let _ = reply.send(result);
+                    }
+                    Ok(WorkerRequest::Stop { reply }) => {
+                        let result = session.stop().map(|()| Value::Null);
+                        let _ = reply.send(result);
+                        return;
+                    }
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => return,
+                }
             }
         });
-        Self {
-            session,
-            stop,
-            error,
+        started_receive
+            .recv()
+            .context("session worker exited during startup")??;
+        Ok(Self {
+            send,
             recording,
             worker: Some(worker),
-        }
+        })
     }
 
-    fn lock(&self) -> Result<MutexGuard<'_, Session>> {
-        if let Some(error) = self.error.lock().unwrap().clone() {
-            bail!("session output pump failed: {error}");
-        }
-        Ok(self.session.lock().unwrap())
+    fn call(
+        &self,
+        operation: impl FnOnce(&mut Session) -> Result<Value> + Send + 'static,
+    ) -> Result<Value> {
+        let (reply, receive) = mpsc::sync_channel(1);
+        self.send
+            .send(WorkerRequest::Call {
+                operation: Box::new(operation),
+                reply,
+            })
+            .map_err(|_| anyhow!("session worker has exited"))?;
+        receive.recv().context("session worker has exited")?
     }
 
     fn stop(mut self) -> Result<()> {
-        self.stop.store(true, Ordering::Relaxed);
+        self.stop_worker()
+    }
+
+    fn stop_worker(&mut self) -> Result<()> {
+        let (reply, receive) = mpsc::sync_channel(1);
+        let result = self
+            .send
+            .send(WorkerRequest::Stop { reply })
+            .map_err(|_| anyhow!("session worker has exited"))
+            .and_then(|()| receive.recv().context("session worker has exited"))
+            .and_then(|result| result.map(|_| ()));
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
-        {
-            let mut session = self.session.lock().unwrap();
-            session.stop()?;
-        }
-        Ok(())
+        result
     }
 
     fn recording(&self) -> Result<Vec<u8>> {
@@ -295,12 +351,8 @@ impl ManagedSession {
 
 impl Drop for ManagedSession {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
-        if let Ok(mut session) = self.session.lock() {
-            let _ = session.stop();
+        if self.worker.is_some() {
+            let _ = self.stop_worker();
         }
     }
 }
@@ -313,49 +365,46 @@ fn dispatch(sessions: &mut HashMap<String, ManagedSession>, request: Request) ->
                 bail!("driver session {session_id:?} already exists");
             }
             let options = options(&params);
-            let session = Session::start(
-                &params.command,
-                params.cwd.as_deref(),
-                params.record.as_deref(),
-                &options,
-            )?;
             sessions.insert(
                 session_id.to_owned(),
-                ManagedSession::new(session, params.record.clone()),
+                ManagedSession::start(params.command, params.cwd, params.record, options)?,
             );
             Ok(json!({ "sessionId": session_id }))
         }
-        Method::Status => Ok(serde_json::to_value(
-            session(sessions, &request.session_id)?.status()?,
-        )?),
+        Method::Status => session(sessions, &request.session_id)?
+            .call(|session| Ok(serde_json::to_value(session.status()?)?)),
         Method::Send(params) => {
             let input = input_bytes(params.input, params.pace_ms > 0)?;
-            session(sessions, &request.session_id)?
-                .send_all(&input, Duration::from_millis(params.pace_ms))?;
-            Ok(Value::Null)
-        }
-        Method::WaitForText(params) => {
-            session(sessions, &request.session_id)?
-                .wait_for_text(&params.text, Duration::from_millis(params.timeout_ms))?;
-            Ok(Value::Null)
-        }
-        Method::WaitForIdle(params) => {
-            session(sessions, &request.session_id)?.wait_for_idle(
-                Duration::from_millis(params.quiet_for_ms),
-                Duration::from_millis(params.timeout_ms),
-            )?;
-            Ok(Value::Null)
-        }
-        Method::WaitForExit(params) => {
-            let exit = session(sessions, &request.session_id)?
-                .wait_for_exit(Duration::from_millis(params.timeout_ms))?;
-            Ok(match exit {
-                Some(exit) => json!({ "reason": "exited", "exit": exit }),
-                None => json!({ "reason": "deadline" }),
+            session(sessions, &request.session_id)?.call(move |session| {
+                session.send_all(&input, Duration::from_millis(params.pace_ms))?;
+                Ok(Value::Null)
             })
         }
-        Method::Capture(params) => {
-            let mut session = session(sessions, &request.session_id)?;
+        Method::WaitForText(params) => {
+            session(sessions, &request.session_id)?.call(move |session| {
+                session.wait_for_text(&params.text, Duration::from_millis(params.timeout_ms))?;
+                Ok(Value::Null)
+            })
+        }
+        Method::WaitForIdle(params) => {
+            session(sessions, &request.session_id)?.call(move |session| {
+                session.wait_for_idle(
+                    Duration::from_millis(params.quiet_for_ms),
+                    Duration::from_millis(params.timeout_ms),
+                )?;
+                Ok(Value::Null)
+            })
+        }
+        Method::WaitForExit(params) => {
+            session(sessions, &request.session_id)?.call(move |session| {
+                let exit = session.wait_for_exit(Duration::from_millis(params.timeout_ms))?;
+                Ok(match exit {
+                    Some(exit) => json!({ "reason": "exited", "exit": exit }),
+                    None => json!({ "reason": "deadline" }),
+                })
+            })
+        }
+        Method::Capture(params) => session(sessions, &request.session_id)?.call(move |session| {
             let mut capture = session.capture(
                 Duration::from_millis(params.settle_ms),
                 Duration::from_millis(params.deadline_ms),
@@ -381,11 +430,13 @@ fn dispatch(sessions: &mut HashMap<String, ManagedSession>, request: Request) ->
                 result["shot"]["svg"] = json!(svg);
             }
             Ok(result)
-        }
-        Method::Logs(params) => Ok(json!({
-            "ansi": params.ansi,
-            "bytes": session(sessions, &request.session_id)?.logs(params.ansi)?
-        })),
+        }),
+        Method::Logs(params) => session(sessions, &request.session_id)?.call(move |session| {
+            Ok(json!({
+                "ansi": params.ansi,
+                "bytes": session.logs(params.ansi)?
+            }))
+        }),
         Method::Recording => {
             let session_id = required_session_id(&request.session_id)?;
             Ok(json!({
@@ -395,8 +446,7 @@ fn dispatch(sessions: &mut HashMap<String, ManagedSession>, request: Request) ->
                     .recording()?
             }))
         }
-        Method::Resize(params) => {
-            let mut session = session(sessions, &request.session_id)?;
+        Method::Resize(params) => session(sessions, &request.session_id)?.call(move |session| {
             let status = session.status()?;
             session.resize(
                 params.cols,
@@ -405,7 +455,7 @@ fn dispatch(sessions: &mut HashMap<String, ManagedSession>, request: Request) ->
                 params.cell_height.unwrap_or(status.cell_height),
             )?;
             Ok(Value::Null)
-        }
+        }),
         Method::Stop => {
             let session_id = required_session_id(&request.session_id)?;
             let session = sessions
@@ -433,12 +483,11 @@ fn required_session_id(session_id: &Option<String>) -> Result<&str> {
 fn session<'a>(
     sessions: &'a mut HashMap<String, ManagedSession>,
     session_id: &Option<String>,
-) -> Result<MutexGuard<'a, Session>> {
+) -> Result<&'a ManagedSession> {
     let session_id = required_session_id(session_id)?;
     sessions
         .get(session_id)
         .ok_or_else(|| anyhow!("driver session {session_id:?} does not exist"))
-        .and_then(ManagedSession::lock)
 }
 
 fn options(params: &LaunchParams) -> Options {
@@ -743,6 +792,57 @@ mod tests {
         handle.join().unwrap();
 
         assert!(marker.exists(), "driver did not pump output while idle");
+        let _ = std::fs::remove_file(marker);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn blocking_request_does_not_stop_other_session_output() {
+        let marker = std::env::temp_dir().join(format!(
+            "termctrl-driver-concurrent-pump-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&marker);
+        let marker_command = format!(
+            "i=0; while [ $i -lt 100 ]; do printf 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'; i=$((i+1)); done; : > '{}'; sleep 1",
+            marker.display()
+        );
+        let requests = [
+            json!({
+                "id": 1,
+                "method": "launch",
+                "sessionId": "noisy",
+                "params": { "command": ["sh", "-c", marker_command] }
+            }),
+            json!({
+                "id": 2,
+                "method": "launch",
+                "sessionId": "waiting",
+                "params": { "command": ["sh", "-c", "sleep 1"] }
+            }),
+            json!({
+                "id": 3,
+                "method": "waitForText",
+                "sessionId": "waiting",
+                "params": { "text": "never", "timeoutMs": 500 }
+            }),
+            json!({"id": 4, "method": "shutdown"}),
+        ]
+        .into_iter()
+        .map(|request| format!("{request}\n"))
+        .collect::<String>();
+        let mut output = Vec::new();
+
+        serve(
+            BufReader::new(Cursor::new(requests.into_bytes())),
+            &mut output,
+        )
+        .unwrap();
+
+        assert!(
+            marker.exists(),
+            "blocking one session stopped another session's PTY reader"
+        );
         let _ = std::fs::remove_file(marker);
     }
 }

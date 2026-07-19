@@ -8,9 +8,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::frame::{Attributes, Cell, Frame, from_screen};
+use crate::frame::{Attributes, Cell, Frame};
 use crate::render;
 use crate::shot::Shot;
+use crate::terminal_core::{SCROLLBACK_ROWS, TerminalCore};
 
 const MAX_VIDEO_FPS: u32 = 1000;
 /// Schema version written in the header of every `.termctrl` recording.
@@ -185,7 +186,7 @@ pub fn video(path: &Path, options: &VideoOptions) -> Result<()> {
         bail!("--fps must not exceed {MAX_VIDEO_FPS}");
     }
     let recording = read(path)?;
-    let states = states(&recording);
+    let states = states(&recording)?;
     let states = visible_states(&states, options.include_startup);
     if states.is_empty() {
         bail!("recording contains no visible output frames");
@@ -305,7 +306,7 @@ pub fn shot_at(path: &Path, at_ms: Option<u64>, marker: Option<&str>) -> Result<
             .with_context(|| format!("recording does not contain marker {marker:?}"))?,
         (None, None) => u64::MAX,
     };
-    let replay = replay(&recording, Some(at_ms));
+    let replay = replay(&recording, Some(at_ms))?;
     Ok(Shot {
         frame: replay
             .frames
@@ -329,17 +330,17 @@ struct Replay {
     frames: Vec<VideoFrame>,
 }
 
-fn states(recording: &Recording) -> Vec<VideoFrame> {
-    replay(recording, None).frames
+fn states(recording: &Recording) -> Result<Vec<VideoFrame>> {
+    Ok(replay(recording, None)?.frames)
 }
 
-fn replay(recording: &Recording, cutoff: Option<u64>) -> Replay {
-    let mut parser = crate::shot::terminal(recording.rows, recording.cols);
+fn replay(recording: &Recording, cutoff: Option<u64>) -> Result<Replay> {
+    let mut terminal = TerminalCore::new(recording.rows, recording.cols, SCROLLBACK_ROWS)?;
     let mut ansi = Vec::new();
     let mut frames: Vec<VideoFrame> = Vec::new();
     frames.push(VideoFrame {
         at_ms: 0,
-        frame: from_screen(parser.screen()),
+        frame: terminal.frame()?,
         footer_caption: None,
     });
     for event in &recording.events {
@@ -349,22 +350,25 @@ fn replay(recording: &Recording, cutoff: Option<u64>) -> Replay {
                     continue;
                 }
                 ansi.extend_from_slice(bytes);
-                parser.process(bytes);
+                let _responses = terminal.apply_output(bytes);
                 *at_ms
             }
             Entry::Resize {
-                at_ms, cols, rows, ..
+                at_ms,
+                cols,
+                rows,
+                cell_width,
+                cell_height,
             } => {
                 if cutoff.is_some_and(|cutoff| *at_ms > cutoff) {
                     continue;
                 }
-                parser = crate::shot::terminal(*rows, *cols);
-                parser.process(&ansi);
+                terminal.resize(*cols, *rows, *cell_width, *cell_height)?;
                 *at_ms
             }
             Entry::Input { .. } | Entry::Marker { .. } | Entry::Header { .. } => continue,
         };
-        let frame = from_screen(parser.screen());
+        let frame = terminal.frame()?;
         if frames
             .last()
             .is_some_and(|previous| previous.frame == frame)
@@ -377,7 +381,7 @@ fn replay(recording: &Recording, cutoff: Option<u64>) -> Replay {
             footer_caption: None,
         });
     }
-    Replay { ansi, frames }
+    Ok(Replay { ansi, frames })
 }
 
 fn visible_states(states: &[VideoFrame], include_startup: bool) -> &[VideoFrame] {
@@ -738,19 +742,14 @@ fn with_footer(mut frame: Frame, caption: Option<&str>, elapsed_ms: u64) -> Fram
     let brand_width = text_width(BRAND);
     let time_width = text_width(&timecode);
     let brand = (brand_width <= frame.cols).then(|| (frame.cols - brand_width, BRAND));
-    let mut reserved_from = brand
+    let time = brand.and_then(|(brand_x, _)| {
+        let x = brand_x.checked_sub(time_width.saturating_add(1))?;
+        Some((x, timecode.as_str()))
+    });
+    let reserved_from = time
         .map(|(x, _)| x.saturating_sub(1))
+        .or_else(|| brand.map(|(x, _)| x.saturating_sub(1)))
         .unwrap_or(frame.cols);
-    let time = if time_width <= reserved_from {
-        let ideal_x = frame.cols.saturating_sub(time_width) / 2;
-        let max_x = reserved_from - time_width;
-        Some((ideal_x.min(max_x), timecode.as_str()))
-    } else {
-        None
-    };
-    if let Some((x, _)) = time {
-        reserved_from = x.saturating_sub(1);
-    }
 
     if let Some(caption) = caption {
         push_footer_cell(
@@ -899,9 +898,9 @@ mod tests {
     }
 
     fn painted_frame() -> Frame {
-        let mut parser = crate::shot::terminal(1, 2);
-        parser.process(b"\x1b[48;2;30;34;42m ");
-        from_screen(parser.screen())
+        let mut terminal = TerminalCore::new(1, 2, 0).unwrap();
+        let _responses = terminal.apply_output(b"\x1b[48;2;30;34;42m ");
+        terminal.frame().unwrap()
     }
 
     #[test]
@@ -1060,12 +1059,23 @@ mod tests {
     fn footer_adds_caption_timecode_and_branding() {
         let frame = with_footer(frame("body"), Some("demo caption"), 65_000);
         let text = frame.text();
+        let time = frame
+            .cells
+            .iter()
+            .find(|cell| cell.text == "01:05")
+            .unwrap();
+        let brand = frame
+            .cells
+            .iter()
+            .find(|cell| cell.text == "TERMINAL CONTROL")
+            .unwrap();
 
         assert_eq!(frame.rows, 3);
         assert!(text.contains("body"));
         assert!(text.contains("demo caption"));
-        assert!(text.contains("01:05"));
-        assert!(text.contains("TERMINAL CONTROL"));
+        assert_eq!(time.x + time.width + 1, brand.x);
+        assert!(time.attributes.faint);
+        assert!(brand.attributes.bold);
     }
 
     #[test]
@@ -1170,7 +1180,7 @@ mod tests {
             ],
         };
 
-        let states = states(&recording);
+        let states = states(&recording).unwrap();
         let cols = states.iter().map(|state| state.frame.cols).max().unwrap();
         let rows = states.iter().map(|state| state.frame.rows).max().unwrap();
         let frames = states
@@ -1184,6 +1194,43 @@ mod tests {
                 .all(|frame| (frame.cols, frame.rows) == (4, 2))
         );
         assert_eq!(frames.last().unwrap().text(), "a");
+    }
+
+    #[test]
+    fn replay_preserves_reflowed_scrollback_across_multiple_resizes() {
+        let recording = Recording {
+            cols: 10,
+            rows: 3,
+            cell_width: 9,
+            cell_height: 18,
+            events: vec![
+                Entry::Output {
+                    at_ms: 1,
+                    bytes: b"abcdefghijklmnopqrst".to_vec(),
+                },
+                Entry::Resize {
+                    at_ms: 2,
+                    cols: 5,
+                    rows: 3,
+                    cell_width: 9,
+                    cell_height: 18,
+                },
+                Entry::Resize {
+                    at_ms: 3,
+                    cols: 10,
+                    rows: 3,
+                    cell_width: 9,
+                    cell_height: 18,
+                },
+            ],
+        };
+
+        let states = states(&recording).unwrap();
+
+        assert_eq!(
+            states.last().unwrap().frame.text(),
+            "abcdefghij\nklmnopqrst"
+        );
     }
 
     #[test]

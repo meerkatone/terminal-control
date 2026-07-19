@@ -35,6 +35,10 @@ export async function packNativePackage(target, binary, output) {
     await cp(join(repository, "packages", target, "package.json"), join(staging, "package.json"))
     await cp(join(repository, "packages", target, "README.md"), join(staging, "README.md"))
     await cp(join(repository, "LICENSE"), join(staging, "LICENSE"))
+    await cp(
+      join(repository, "THIRD_PARTY_LICENSES.md"),
+      join(staging, "THIRD_PARTY_LICENSES.md"),
+    )
     await cp(binary, join(staging, "bin", "termctrl"))
     await chmod(join(staging, "bin", "termctrl"), 0o755)
     run(join(staging, "bin", "termctrl"), ["--version"], staging)

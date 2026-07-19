@@ -16,3 +16,4 @@ pub mod recording;
 pub mod render;
 pub mod session;
 pub mod shot;
+mod terminal_core;

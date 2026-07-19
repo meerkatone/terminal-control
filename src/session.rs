@@ -5,19 +5,16 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::recording::{self, InputOrigin};
+use crate::shot::{self, Host, Options, Shot, respond_to_output};
+use crate::terminal_core::{SCROLLBACK_ROWS, TerminalCore};
 use anyhow::{Context, Result, bail};
 use portable_pty::{Child, CommandBuilder, ExitStatus, MasterPty, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
-use vt100::Parser;
-
-use crate::frame::from_screen;
-use crate::recording::{self, InputOrigin};
-use crate::shot::{self, Host, Options, Shot};
 
 const OUTPUT_BATCH: usize = 1;
 const OUTPUT_QUEUE: usize = 4;
 const OUTPUT_CHUNK: usize = 1024;
-const SCROLLBACK_ROWS: usize = 10_000;
 
 struct Output {
     at_ms: u64,
@@ -28,13 +25,14 @@ struct Output {
 ///
 /// `Session` is the embedded equivalent of the CLI `session` lifecycle. It owns a PTY and the
 /// visible terminal state, so callers can send input, wait for content, take shots, and resize
-/// without spawning a new `termctrl` command for each action.
+/// without spawning a new `termctrl` command for each action. Ghostty terminal state is
+/// thread-confined, so a session must remain on the thread where it was created.
 pub struct Session {
     master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send>,
     #[cfg(unix)]
     process_group: Option<i32>,
-    parser: Parser,
+    terminal: TerminalCore,
     ansi: Vec<u8>,
     host: Host,
     receive: Receiver<Option<Output>>,
@@ -166,6 +164,7 @@ impl Session {
             None => std::env::current_dir().context("resolve session working directory")?,
         };
         let cwd = fs::canonicalize(&cwd).context("canonicalize session working directory")?;
+        let terminal = TerminalCore::new(options.rows, options.cols, SCROLLBACK_ROWS)?;
         let started = Instant::now();
         let recording = record
             .map(|path| {
@@ -233,7 +232,7 @@ impl Session {
             child,
             #[cfg(unix)]
             process_group,
-            parser: session_terminal(options.rows, options.cols),
+            terminal,
             ansi: Vec::new(),
             host: Host::new(writer, options),
             receive,
@@ -299,7 +298,7 @@ impl Session {
         let deadline = Instant::now() + timeout;
         loop {
             self.consume_batch()?;
-            if self.parser.screen().contents().contains(text) {
+            if self.terminal.text()?.contains(text) {
                 return Ok(());
             }
             if self.has_exited()? || self.stopped {
@@ -363,7 +362,7 @@ impl Session {
             if let Some(reason) = reason {
                 return Ok(CaptureResult {
                     shot: Shot {
-                        frame: from_screen(self.parser.screen()),
+                        frame: self.terminal.frame()?,
                         ansi: self.ansi.clone(),
                     },
                     reason,
@@ -390,7 +389,7 @@ impl Session {
             idle_for_ms: self
                 .last_output
                 .map(|last| last.elapsed().as_millis() as u64),
-            has_visible_content: from_screen(self.parser.screen()).has_visible_content(),
+            has_visible_content: self.terminal.frame()?.has_visible_content(),
             recording: self.recording.is_some(),
             logs_truncated: self.ansi_truncated,
             launch: self.launch.clone(),
@@ -403,28 +402,7 @@ impl Session {
         if ansi {
             return Ok(self.ansi.clone());
         }
-        let mut screen = self.parser.screen().clone();
-        screen.set_scrollback(usize::MAX);
-        let mut offset = screen.scrollback();
-        let mut lines = Vec::new();
-        while offset > 0 {
-            screen.set_scrollback(offset);
-            let count = offset.min(usize::from(self.rows));
-            lines.extend(
-                screen
-                    .rows(0, self.cols)
-                    .take(count)
-                    .map(|line| line.trim_end().to_owned()),
-            );
-            offset = offset.saturating_sub(usize::from(self.rows));
-        }
-        screen.set_scrollback(0);
-        lines.extend(
-            screen
-                .rows(0, self.cols)
-                .map(|line| line.trim_end().to_owned()),
-        );
-        Ok(lines.join("\n").trim_end().as_bytes().to_vec())
+        self.terminal.scrollback_text()
     }
 
     /// Resize the PTY and reflow subsequent terminal parsing at the new dimensions.
@@ -438,9 +416,6 @@ impl Session {
         if cols == 0 || rows == 0 {
             bail!("terminal dimensions must be greater than zero");
         }
-        if self.ansi_truncated {
-            bail!("resizing sessions after retained output is truncated is not yet supported");
-        }
         self.consume_batch()?;
         self.master
             .resize(PtySize {
@@ -451,8 +426,7 @@ impl Session {
             })
             .context("resize session pseudo-terminal")?;
         self.host.resize(cols, rows, cell_width, cell_height);
-        self.parser = session_terminal(rows, cols);
-        self.parser.process(&self.ansi);
+        self.terminal.resize(cols, rows, cell_width, cell_height)?;
         self.cols = cols;
         self.rows = rows;
         self.cell_width = cell_width;
@@ -583,7 +557,7 @@ impl Session {
         if let Some(recording) = &mut self.recording {
             recording.output(output.at_ms, &output.bytes)?;
         }
-        let response = self.host.respond(&output.bytes)?;
+        let response = respond_to_output(&mut self.terminal, &mut self.host, &output.bytes)?;
         if !response.is_empty()
             && let Some(recording) = &mut self.recording
         {
@@ -595,7 +569,6 @@ impl Session {
             self.max_bytes,
             &mut self.ansi_truncated,
         );
-        self.parser.process(&output.bytes);
         self.last_output = Some(Instant::now());
         Ok(())
     }
@@ -622,10 +595,6 @@ fn retain_recent(ansi: &mut Vec<u8>, bytes: &[u8], max_bytes: usize, truncated: 
         *truncated = true;
     }
     ansi.extend_from_slice(bytes);
-}
-
-fn session_terminal(rows: u16, cols: u16) -> Parser {
-    Parser::new(rows, cols, SCROLLBACK_ROWS)
 }
 
 impl Drop for Session {
@@ -1520,7 +1489,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn session_retains_recent_output_without_failing_after_limit() {
+    fn session_resizes_after_retained_output_is_truncated() {
         let mut session = Session::start(
             &[
                 "sh".to_owned(),
@@ -1541,6 +1510,10 @@ mod tests {
 
         assert_eq!(session.logs(true).unwrap(), b"6789");
         assert!(session.status().unwrap().logs_truncated);
+        session.resize(4, 3, 9, 18).unwrap();
+        let capture = session.capture(Duration::ZERO, Duration::ZERO).unwrap();
+        assert_eq!((capture.shot.frame.cols, capture.shot.frame.rows), (4, 3));
+        assert_eq!(capture.shot.frame.text(), "1234\n5678\n9");
         session.stop().unwrap();
     }
 

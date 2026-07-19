@@ -11,10 +11,11 @@ Saved from one live OpenCode session using `start`, `send`, and `save`.
 
 ## Install
 
-Requires Rust 1.93 or newer. Video export also requires `ffmpeg`.
+Source builds require Rust 1.93 or newer, Zig 0.15.2, Git, and network access while the pinned
+Ghostty terminal core is built. Video export also requires `ffmpeg`.
 
 ```bash
-cargo install terminal-control
+cargo install --locked terminal-control
 termctrl --help
 ```
 
@@ -213,5 +214,5 @@ See [docs/typescript-client.md](docs/typescript-client.md) for artifacts, record
 
 - Persistent sessions use owner-only local Unix sockets and are supported on macOS and Linux.
 - `--host opentui` answers startup probes needed by current OpenTUI applications.
-- The renderer uses a pure-Rust `vt100` backend and exports PNG, SVG, JSON, text, and raw ANSI artifacts.
+- Terminal state and reflow use the statically linked Ghostty terminal core; renderers export PNG, SVG, JSON, text, and raw ANSI artifacts.
 - Run `termctrl <command> --help` for dimensions, timing, color, rendering, and output options.
