@@ -25,9 +25,9 @@ struct SessionName {
 #[serde(rename_all = "camelCase")]
 struct ScreenRequest {
     name: String,
-    #[serde(default = "default_settle_ms")]
+    #[serde(default)]
     settle_ms: u64,
-    #[serde(default = "default_deadline_ms")]
+    #[serde(default)]
     deadline_ms: u64,
 }
 
@@ -425,6 +425,17 @@ mod tests {
             input,
             [b":edit src/App.tsx".to_vec(), b"\r".to_vec(), vec![3]]
         );
+    }
+
+    #[test]
+    fn screen_requests_default_to_an_immediate_snapshot() {
+        let request: ScreenRequest = serde_json::from_value(serde_json::json!({
+            "name": "editor"
+        }))
+        .unwrap();
+
+        assert_eq!(request.settle_ms, 0);
+        assert_eq!(request.deadline_ms, 0);
     }
 
     #[test]
