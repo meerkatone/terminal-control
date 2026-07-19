@@ -1,5 +1,12 @@
 # @kitlangton/terminal-control
 
+## 0.4.1
+
+### Patch Changes
+
+- 1d41583: Update package README: remove stale pre-publication phrasing and point to the full client documentation in the repository docs.
+- c1d37db: Make MCP screen reads and interactions return immediately by default, preventing animated terminal output from delaying control requests until the capture deadline.
+
 ## 0.4.0
 
 ### Minor Changes
