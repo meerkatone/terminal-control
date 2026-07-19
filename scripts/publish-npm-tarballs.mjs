@@ -27,7 +27,8 @@ if (versions.size !== 1) {
   throw new Error(`npm package versions are not aligned: ${[...versions].join(", ")}`)
 }
 for (const name of [...nativePackages.map((entry) => entry.name), clientPackage]) {
-  if (!checkOnly) publish(resolve(directory, tarballs.get(name).file))
+  const { file, version } = tarballs.get(name)
+  if (!checkOnly && !isPublished(name, version)) publish(resolve(directory, file))
 }
 if (checkOnly) console.log(`validated complete npm release set at version ${[...versions][0]}`)
 
@@ -35,6 +36,19 @@ function manifestOf(tarball) {
   const result = spawnSync("tar", ["-xOf", tarball, "package/package.json"], { encoding: "utf8" })
   if (result.status !== 0) throw new Error(`read ${tarball}: ${result.stderr}`)
   return JSON.parse(result.stdout)
+}
+
+function isPublished(name, version) {
+  const result = spawnSync("npm", ["view", `${name}@${version}`, "version", "--json"], {
+    encoding: "utf8",
+  })
+  if (result.status !== 0) return false
+  const published = JSON.parse(result.stdout)
+  if (published !== version) {
+    throw new Error(`npm returned unexpected version for ${name}@${version}: ${published}`)
+  }
+  console.log(`skipping already published ${name}@${version}`)
+  return true
 }
 
 function publish(file) {

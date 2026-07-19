@@ -10,6 +10,8 @@ For user-facing npm changes:
 2. Run `bun run version-packages`, refresh `bun.lock`, and commit the versioned package metadata.
 3. Run the `npm-release.yml` workflow with `publish: false` to assemble packages only, or `publish: true` to publish assembled tarballs after its clean Bun and Node/Vitest consumer validation passes.
 
+Publishing is retry-safe: the release script skips an exact package version already present in npm before continuing through the fixed package set.
+
 ## Trusted Publishing
 
 The publish job uses npm trusted publishing through GitHub Actions OIDC. In npm package settings, `anomalyco/terminal-control` with workflow `npm-release.yml` must be configured as the trusted publisher for the client and each platform package before using `publish: true`.
