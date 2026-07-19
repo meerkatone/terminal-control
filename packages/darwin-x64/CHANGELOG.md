@@ -1,5 +1,11 @@
 # @kitlangton/terminal-control-darwin-x64
 
+## 0.4.0
+
+### Minor Changes
+
+- 797b975: Add `termctrl run` for visible foreground sessions, including optional names inferred from the executable basename, and add `termctrl mcp` for structured agent control through the official Rust MCP SDK.
+
 ## 0.3.1
 
 ## 0.3.0
