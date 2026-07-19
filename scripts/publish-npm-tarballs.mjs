@@ -44,7 +44,8 @@ function isPublished(name, version) {
   })
   if (result.status !== 0) return false
   const published = JSON.parse(result.stdout)
-  if (published !== version) {
+  const publishedVersions = Array.isArray(published) ? published : [published]
+  if (!publishedVersions.includes(version)) {
     throw new Error(`npm returned unexpected version for ${name}@${version}: ${published}`)
   }
   console.log(`skipping already published ${name}@${version}`)
