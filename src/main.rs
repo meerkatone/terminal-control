@@ -1147,27 +1147,6 @@ fn show_semantic(args: &ShowArgs) -> Result<()> {
         .name
         .as_deref()
         .context("semantic output requires a named session or workspace")?;
-    if source.pipe
-        || source.input.is_some()
-        || source.recording.is_some()
-        || source.at_marker.is_some()
-        || source.at_ms.is_some()
-        || source.cols.is_some()
-        || source.rows.is_some()
-        || source.color.is_some()
-        || source.settle_ms.is_some()
-        || source.initial_delay_ms.is_some()
-        || source.wait_for.is_some()
-        || source.max_bytes.is_some()
-        || source.cwd.is_some()
-        || source.host.is_some()
-        || !source.send.is_empty()
-        || !source.command.is_empty()
-    {
-        bail!(
-            "semantic output supports a named target, --window or --pane, and --deadline-ms only"
-        );
-    }
     let timeout = Duration::from_millis(source.deadline_ms.unwrap_or(1000));
     if timeout.is_zero() {
         bail!("--deadline-ms must be greater than zero for semantic output");

@@ -1,10 +1,10 @@
 # Releasing Terminal Control
 
 Terminal Control releases one aligned version across the public `terminal-control` crate, the
-`@kitlangton/terminal-control` client, and four native npm packages. The independently versioned
-`@kitlangton/terminal-control-opentui` adapter publishes from its package-local Node release script.
-npm packages are published by the manual `npm-release.yml` workflow; crates.io publication and the
-GitHub release are separate explicit steps.
+`@kitlangton/terminal-control` client, the `@kitlangton/terminal-control-opentui` adapter, and four native npm
+packages. The adapter publishes from its package-local Node release script while the fixed native
+tarball set keeps its existing publisher. npm packages are published by the manual
+`npm-release.yml` workflow; crates.io publication and the GitHub release are separate explicit steps.
 
 ## Prepare The Version
 
@@ -21,7 +21,9 @@ have Changesets.
    `main` through CI.
 
 Native packaging rejects a Rust executable whose `termctrl --version` differs from its npm package
-manifest. Do not bypass that check or publish package formats at different versions.
+manifest. The OpenTUI release script reads the TypeScript client version and updates its package
+manifest to match before publishing. Do not bypass the native checks or publish package formats at
+different versions.
 
 ## Validate The Release
 
