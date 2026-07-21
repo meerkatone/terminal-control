@@ -191,7 +191,30 @@ impl Session {
         record: Option<&Path>,
         options: &Options,
     ) -> Result<Self> {
-        Self::start_with_theme(command, cwd, record, options, TerminalTheme::default())
+        Self::start_internal(
+            command,
+            cwd,
+            record,
+            options,
+            TerminalTheme::default(),
+            true,
+        )
+    }
+
+    pub(crate) fn start_without_semantics(
+        command: &[String],
+        cwd: Option<&Path>,
+        record: Option<&Path>,
+        options: &Options,
+    ) -> Result<Self> {
+        Self::start_internal(
+            command,
+            cwd,
+            record,
+            options,
+            TerminalTheme::default(),
+            false,
+        )
     }
 
     pub(crate) fn start_with_theme(
@@ -200,6 +223,17 @@ impl Session {
         record: Option<&Path>,
         options: &Options,
         theme: TerminalTheme,
+    ) -> Result<Self> {
+        Self::start_internal(command, cwd, record, options, theme, true)
+    }
+
+    fn start_internal(
+        command: &[String],
+        cwd: Option<&Path>,
+        record: Option<&Path>,
+        options: &Options,
+        theme: TerminalTheme,
+        semantic: bool,
     ) -> Result<Self> {
         if command.is_empty() {
             bail!("provide a command after --");
@@ -238,11 +272,11 @@ impl Session {
                 pixel_height: options.cell_height,
             })
             .context("open session pseudo-terminal")?;
-        let semantic = semantic::Host::bind()?;
+        let semantic = semantic.then(semantic::Host::bind).transpose()?;
         let mut builder = CommandBuilder::new(&command[0]);
         builder.args(&command[1..]);
         shot::configure_pty_environment(&mut builder, options);
-        if let Some(path) = semantic.path() {
+        if let Some(path) = semantic.as_ref().and_then(semantic::Host::path) {
             builder.env(semantic::SOCKET_ENV, path);
         }
         builder.cwd(&cwd);
@@ -325,7 +359,7 @@ impl Session {
                 color: options.color,
             },
             mirror: None,
-            semantic: Some(semantic),
+            semantic,
         })
     }
 
