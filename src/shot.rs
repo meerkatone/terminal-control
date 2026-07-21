@@ -13,6 +13,8 @@ use anyhow::{Context, Result, bail};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
 
+use crate::semantic;
+
 const OPENTUI_QUERY: &[u8] = b"\x1b]10;?\x07\x1b]11;?\x07";
 #[cfg(test)]
 const PALETTE_QUERY: &[u8] = b"\x1b]4;0;?\x07";
@@ -104,9 +106,13 @@ pub fn from_command(command: &[String], cwd: Option<&Path>, options: &Options) -
             pixel_height: options.cell_height,
         })
         .context("open pseudo-terminal")?;
+    let mut semantic = semantic::Host::bind()?;
     let mut builder = CommandBuilder::new(&command[0]);
     builder.args(&command[1..]);
     configure_pty_environment(&mut builder, options);
+    if let Some(path) = semantic.path() {
+        builder.env(semantic::SOCKET_ENV, path);
+    }
     if let Some(cwd) = cwd {
         builder.cwd(cwd);
     }
@@ -150,6 +156,7 @@ pub fn from_command(command: &[String], cwd: Option<&Path>, options: &Options) -
             &mut terminal,
             &mut ansi,
             &mut host,
+            &mut semantic,
             options,
             &mut clock,
         )?;
@@ -169,6 +176,7 @@ pub fn from_command(command: &[String], cwd: Option<&Path>, options: &Options) -
                 &mut terminal,
                 &mut ansi,
                 &mut host,
+                &mut semantic,
                 options,
                 &mut clock,
             )?;
@@ -208,6 +216,7 @@ pub fn from_pipe_command(
         bail!("provide a command after --");
     }
     validate_geometry(options.rows, options.cols)?;
+    let mut semantic = semantic::Host::bind()?;
     let mut builder = ProcessCommand::new(&command[0]);
     builder
         .args(&command[1..])
@@ -220,6 +229,9 @@ pub fn from_pipe_command(
         builder.process_group(0);
     }
     configure_process_environment(&mut builder, options);
+    if let Some(path) = semantic.path() {
+        builder.env(semantic::SOCKET_ENV, path);
+    }
     if let Some(cwd) = cwd {
         builder.current_dir(cwd);
     }
@@ -242,6 +254,7 @@ pub fn from_pipe_command(
         let mut open_streams = 2_usize;
         let mut exited = false;
         while open_streams > 0 || !exited {
+            semantic.pump();
             let timeout = deadline
                 .saturating_duration_since(Instant::now())
                 .min(Duration::from_millis(20));
@@ -389,6 +402,7 @@ fn consume_until_ready(
     terminal: &mut TerminalCore,
     ansi: &mut Vec<u8>,
     host: &mut Host,
+    semantic: &mut semantic::Host,
     options: &Options,
     clock: &mut Clock,
 ) -> Result<bool> {
@@ -396,14 +410,30 @@ fn consume_until_ready(
     let delay_end = (clock.started + options.initial_delay).min(clock.deadline);
     while !closed && Instant::now() < delay_end {
         closed = matches!(
-            receive_chunk(receive, terminal, ansi, host, options.max_bytes, clock)?,
+            receive_chunk(
+                receive,
+                terminal,
+                ansi,
+                host,
+                semantic,
+                options.max_bytes,
+                clock,
+            )?,
             Chunk::Closed
         );
     }
     if let Some(pattern) = &options.wait_for {
         while !closed && Instant::now() < clock.deadline && !terminal.text()?.contains(pattern) {
             closed = matches!(
-                receive_chunk(receive, terminal, ansi, host, options.max_bytes, clock)?,
+                receive_chunk(
+                    receive,
+                    terminal,
+                    ansi,
+                    host,
+                    semantic,
+                    options.max_bytes,
+                    clock,
+                )?,
                 Chunk::Closed
             );
         }
@@ -415,7 +445,7 @@ fn consume_until_ready(
     {
         return Ok(false);
     }
-    consume_until_settled(receive, terminal, ansi, host, options, clock)
+    consume_until_settled(receive, terminal, ansi, host, semantic, options, clock)
 }
 
 enum Chunk {
@@ -435,9 +465,11 @@ fn receive_chunk(
     terminal: &mut TerminalCore,
     ansi: &mut Vec<u8>,
     host: &mut Host,
+    semantic: &mut semantic::Host,
     max_bytes: usize,
     clock: &mut Clock,
 ) -> Result<Chunk> {
+    semantic.pump();
     let timeout = clock
         .deadline
         .saturating_duration_since(Instant::now())
@@ -478,11 +510,20 @@ fn consume_until_settled(
     terminal: &mut TerminalCore,
     ansi: &mut Vec<u8>,
     host: &mut Host,
+    semantic: &mut semantic::Host,
     options: &Options,
     clock: &mut Clock,
 ) -> Result<bool> {
     loop {
-        match receive_chunk(receive, terminal, ansi, host, options.max_bytes, clock)? {
+        match receive_chunk(
+            receive,
+            terminal,
+            ansi,
+            host,
+            semantic,
+            options.max_bytes,
+            clock,
+        )? {
             Chunk::Output => {}
             Chunk::Closed => return Ok(true),
             Chunk::Timeout => {
@@ -796,6 +837,42 @@ mod tests {
 
         assert_eq!(captured.frame.text(), "one\ntwo");
         assert!(captured.ansi.windows(2).any(|window| window == b"\r\n"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn launched_commands_receive_the_application_semantic_socket() {
+        let command = [
+            "sh".to_owned(),
+            "-c".to_owned(),
+            format!(
+                "if [ -S \"${}\" ]; then printf semantic-ready; else printf semantic-missing; fi",
+                semantic::SOCKET_ENV
+            ),
+        ];
+
+        let pty = from_command(
+            &command,
+            None,
+            &Options {
+                settle: Duration::from_millis(10),
+                deadline: Duration::from_secs(2),
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        let pipe = from_pipe_command(
+            &command,
+            None,
+            &Options {
+                deadline: Duration::from_secs(2),
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(pty.frame.text(), "semantic-ready");
+        assert_eq!(pipe.frame.text(), "semantic-ready");
     }
 
     #[cfg(unix)]

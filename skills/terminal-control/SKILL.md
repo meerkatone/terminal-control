@@ -97,6 +97,15 @@ transition needs quiet-output settling.
 `wait` defaults to a five-second maximum and returns as soon as its text appears. Do not pass
 `--timeout 5000`; omit it. Set `--timeout` only when intentionally choosing a different limit.
 
+## Semantic UI tree
+
+The `show` command takes an option `--format semantic` which returns a semantic tree representing the
+interactable UI elements. This requires direct support from the application to work; once the app is ready
+you can run this and see if it returns anything. If it does not, never try again for that session.
+The full command is `termctrl show app --format semantic`.
+
+Attempt to use the semantic UI tree if you need to discover available UI elements.
+
 ## Drive Input Precisely
 
 Send plain text with `text:<value>` and named keys as separate input atoms:

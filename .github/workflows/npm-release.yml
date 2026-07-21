@@ -105,9 +105,11 @@ jobs:
           node-version: 24
           registry-url: https://registry.npmjs.org
       - run: npm install --global npm@latest
+      - run: npm install --ignore-scripts --no-package-lock --workspaces=false
+        working-directory: packages/opentui
       - uses: actions/download-artifact@v8
         with:
           pattern: npm-*
           path: npm-artifacts
           merge-multiple: true
-      - run: node scripts/publish-npm-tarballs.mjs npm-artifacts
+      - run: node scripts/release-packages.mjs

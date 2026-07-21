@@ -783,6 +783,30 @@ impl Workspace {
         self.windows[index].active_logs(ansi)
     }
 
+    pub(crate) fn semantic_snapshot_in(
+        &mut self,
+        name: Option<&str>,
+        pane: Option<PaneId>,
+        timeout: Duration,
+    ) -> Result<serde_json::Value> {
+        if name.is_some() && pane.is_some() {
+            bail!("window and pane cannot be combined; pane ids are already globally stable");
+        }
+        let index = pane
+            .and_then(|pane| self.pane_window_index(pane))
+            .map_or_else(|| self.window_index_or_active(name), Ok)?;
+        let pane = pane
+            .or(self.windows[index].active)
+            .context("workspace target has no active pane")?;
+        self.windows[index]
+            .panes
+            .iter_mut()
+            .find(|candidate| candidate.id == pane)
+            .with_context(|| format!("workspace has no pane {pane}"))?
+            .session
+            .semantic_snapshot(timeout)
+    }
+
     pub(crate) fn create_window(
         &mut self,
         name: Option<&str>,
@@ -5337,6 +5361,26 @@ mod tests {
                 && cell.width == 6
                 && cell.background == crate::frame::Color { r: 1, g: 2, b: 3 }
         }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_semantic_snapshot_is_empty_without_a_provider() {
+        let mut workspace = Workspace::start(
+            &["sh".to_owned(), "-c".to_owned(), "sleep 10".to_owned()],
+            None,
+            None,
+            &Options::default(),
+        )
+        .unwrap();
+
+        let snapshot = workspace
+            .semantic_snapshot_in(None, None, Duration::from_secs(1))
+            .unwrap();
+
+        assert_eq!(snapshot["format"], "termctrl-semantic-snapshot-v1");
+        assert_eq!(snapshot["nodes"], serde_json::json!([]));
+        workspace.stop();
     }
 
     #[cfg(unix)]

@@ -1,0 +1,47 @@
+{
+  "name": "@kitlangton/terminal-control-opentui",
+  "version": "0.4.1",
+  "description": "Expose consistent OpenTUI semantic snapshots through Terminal Control",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/anomalyco/terminal-control.git",
+    "directory": "packages/opentui"
+  },
+  "type": "module",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "types": "./dist/index.d.ts",
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.build.json",
+    "test": "bun test src/index.test.ts",
+    "typecheck": "tsc --noEmit",
+    "prepack": "npm run build",
+    "release": "node script/release.mjs",
+    "release:check": "node script/release.mjs --check"
+  },
+  "peerDependencies": {
+    "@opentui/core": ">=0.4.0 <1"
+  },
+  "devDependencies": {
+    "@opentui/core": "^0.4.5",
+    "@types/bun": "^1.3.0",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  }
+}
