@@ -6,6 +6,8 @@ use crate::frame::{Cell, Frame, Underline};
 
 mod box_drawing;
 
+const MAX_PNG_PIXELS: u64 = 64 * 1024 * 1024;
+
 #[derive(Clone, Debug)]
 pub struct Options {
     pub cell_width: f32,
@@ -87,11 +89,25 @@ impl PngRenderer {
     }
 
     pub fn render(&self, svg: &str, path: &Path, pixel_ratio: f32) -> Result<()> {
+        if !pixel_ratio.is_finite() || pixel_ratio <= 0.0 {
+            anyhow::bail!("PNG pixel ratio must be finite and greater than zero");
+        }
         let tree = resvg::usvg::Tree::from_data(svg.as_bytes(), &self.options)
             .context("parse rendered SVG")?;
         let size = tree.size().to_int_size();
-        let width = ((size.width() as f32) * pixel_ratio).ceil() as u32;
-        let height = ((size.height() as f32) * pixel_ratio).ceil() as u32;
+        let width = ((size.width() as f64) * f64::from(pixel_ratio)).ceil();
+        let height = ((size.height() as f64) * f64::from(pixel_ratio)).ceil();
+        if width > f64::from(u32::MAX) || height > f64::from(u32::MAX) {
+            anyhow::bail!("PNG dimensions exceed the supported range");
+        }
+        let width = width as u32;
+        let height = height as u32;
+        let pixels = u64::from(width)
+            .checked_mul(u64::from(height))
+            .context("PNG pixel count overflow")?;
+        if pixels > MAX_PNG_PIXELS {
+            anyhow::bail!("PNG would contain {pixels} pixels; limit is {MAX_PNG_PIXELS}");
+        }
         let mut pixmap =
             resvg::tiny_skia::Pixmap::new(width, height).context("allocate PNG canvas")?;
         resvg::render(
@@ -190,21 +206,21 @@ fn graphic(cell: &Cell, options: &Options) -> Option<String> {
     };
     let codepoint = char as u32;
     if (0x2800..=0x28ff).contains(&codepoint) {
-        return Some(braille_dots(
-            codepoint - 0x2800,
-            &circle,
-            width.min(height) * 0.09,
+        return Some(graphic_opacity(
+            cell,
+            braille_dots(codepoint - 0x2800, &circle, width.min(height) * 0.09),
         ));
     }
     if let Some(rects) = box_drawing::rects(char, width, height) {
-        return Some(
+        return Some(graphic_opacity(
+            cell,
             rects
                 .into_iter()
                 .map(|rect| single(rect.left, rect.top, rect.width, rect.height))
                 .collect(),
-        );
+        ));
     }
-    Some(match char {
+    let graphic = match char {
         '█' => single(0.0, 0.0, 1.0, 1.0),
         '▀' => single(0.0, 0.0, 1.0, 0.5),
         '▄' => single(0.0, 0.5, 1.0, 0.5),
@@ -248,7 +264,16 @@ fn graphic(cell: &Cell, options: &Options) -> Option<String> {
         }
         '◔' => ring(0.5, 0.52, width.min(height) * 0.32) + &single(0.5, 0.2, 0.32, 0.32),
         _ => return None,
-    })
+    };
+    Some(graphic_opacity(cell, graphic))
+}
+
+fn graphic_opacity(cell: &Cell, graphic: String) -> String {
+    if cell.attributes.faint {
+        format!(r#"<g opacity="0.55">{graphic}</g>"#)
+    } else {
+        graphic
+    }
 }
 
 fn braille_dots(pattern: u32, circle: &impl Fn(f32, f32, f32) -> String, radius: f32) -> String {
@@ -322,6 +347,21 @@ fn xml(value: &str) -> String {
 mod tests {
     use super::*;
     use crate::frame::{Attributes, Color, Frame, Underline};
+
+    #[test]
+    fn rejects_png_allocations_above_the_pixel_limit() {
+        let path = std::env::temp_dir().join("termctrl-oversized-png-test.png");
+        let error = PngRenderer::new()
+            .render(
+                r#"<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"/>"#,
+                &path,
+                10_000.0,
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("limit"));
+        assert!(!path.exists());
+    }
 
     #[test]
     fn emits_background_and_text_styles_in_svg() {
@@ -420,7 +460,10 @@ mod tests {
                         b: 255,
                     },
                     background: Color { r: 0, g: 0, b: 0 },
-                    attributes: Attributes::default(),
+                    attributes: Attributes {
+                        faint: true,
+                        ..Attributes::default()
+                    },
                 })
                 .collect(),
         };
@@ -429,6 +472,7 @@ mod tests {
 
         assert!(!output.contains(">━</text>"));
         assert_eq!(output.matches("<rect").count(), 3);
+        assert_eq!(output.matches("<g opacity=\"0.55\">").count(), 2);
     }
 
     #[test]
