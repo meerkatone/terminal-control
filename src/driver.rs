@@ -681,7 +681,7 @@ mod tests {
     fn driver_launch_can_clear_and_supply_environment() {
         unsafe { std::env::set_var("TERMCTRL_PARENT_ONLY", "leak") };
         let requests = concat!(
-            r#"{"id":1,"method":"launch","sessionId":"app","params":{"command":["/bin/sh","-c","printf '%s:%s' \"${TERMCTRL_PARENT_ONLY-unset}\" \"$VISIBLE\""],"inheritEnv":false,"env":{"VISIBLE":"set"}}}"#,
+            r#"{"id":1,"method":"launch","sessionId":"app","params":{"command":["/bin/sh","-c","printf '%s:%s:%s' \"${TERMCTRL_PARENT_ONLY-unset}\" \"$VISIBLE\" \"${TERMCTRL_SEMANTIC_SOCKET-unset}\""],"inheritEnv":false,"env":{"VISIBLE":"set"}}}"#,
             "\n",
             r#"{"id":2,"method":"capture","sessionId":"app","params":{"settleMs":10,"deadlineMs":2000}}"#,
             "\n",
@@ -701,7 +701,7 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str::<Value>(line).unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(messages[2]["result"]["shot"]["text"], "unset:set");
+        assert_eq!(messages[2]["result"]["shot"]["text"], "unset:set:unset");
     }
 
     #[cfg(unix)]

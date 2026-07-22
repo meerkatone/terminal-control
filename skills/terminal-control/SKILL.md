@@ -102,7 +102,8 @@ transition needs quiet-output settling.
 The `show` command takes an option `--format semantic` which returns a semantic tree representing the
 interactable UI elements. This requires direct support from the application to work; once the app is ready
 you can run this and see if it returns anything. If it does not, never try again for that session.
-The full command is `termctrl show app --format semantic`.
+The application must be launched with `--host opentui`; the full read command is
+`termctrl show app --format semantic`.
 
 Attempt to use the semantic UI tree if you need to discover available UI elements.
 

@@ -106,11 +106,14 @@ pub fn from_command(command: &[String], cwd: Option<&Path>, options: &Options) -
             pixel_height: options.cell_height,
         })
         .context("open pseudo-terminal")?;
-    let mut semantic = semantic::Host::bind()?;
+    let mut semantic = options
+        .opentui_host
+        .then(semantic::Host::bind)
+        .transpose()?;
     let mut builder = CommandBuilder::new(&command[0]);
     builder.args(&command[1..]);
     configure_pty_environment(&mut builder, options);
-    if let Some(path) = semantic.path() {
+    if let Some(path) = semantic.as_ref().and_then(semantic::Host::path) {
         builder.env(semantic::SOCKET_ENV, path);
     }
     if let Some(cwd) = cwd {
@@ -216,7 +219,10 @@ pub fn from_pipe_command(
         bail!("provide a command after --");
     }
     validate_geometry(options.rows, options.cols)?;
-    let mut semantic = semantic::Host::bind()?;
+    let mut semantic = options
+        .opentui_host
+        .then(semantic::Host::bind)
+        .transpose()?;
     let mut builder = ProcessCommand::new(&command[0]);
     builder
         .args(&command[1..])
@@ -229,7 +235,7 @@ pub fn from_pipe_command(
         builder.process_group(0);
     }
     configure_process_environment(&mut builder, options);
-    if let Some(path) = semantic.path() {
+    if let Some(path) = semantic.as_ref().and_then(semantic::Host::path) {
         builder.env(semantic::SOCKET_ENV, path);
     }
     if let Some(cwd) = cwd {
@@ -254,7 +260,9 @@ pub fn from_pipe_command(
         let mut open_streams = 2_usize;
         let mut exited = false;
         while open_streams > 0 || !exited {
-            semantic.pump();
+            if let Some(semantic) = &mut semantic {
+                semantic.pump();
+            }
             let timeout = deadline
                 .saturating_duration_since(Instant::now())
                 .min(Duration::from_millis(20));
@@ -402,7 +410,7 @@ fn consume_until_ready(
     terminal: &mut TerminalCore,
     ansi: &mut Vec<u8>,
     host: &mut Host,
-    semantic: &mut semantic::Host,
+    semantic: &mut Option<semantic::Host>,
     options: &Options,
     clock: &mut Clock,
 ) -> Result<bool> {
@@ -465,11 +473,13 @@ fn receive_chunk(
     terminal: &mut TerminalCore,
     ansi: &mut Vec<u8>,
     host: &mut Host,
-    semantic: &mut semantic::Host,
+    semantic: &mut Option<semantic::Host>,
     max_bytes: usize,
     clock: &mut Clock,
 ) -> Result<Chunk> {
-    semantic.pump();
+    if let Some(semantic) = semantic {
+        semantic.pump();
+    }
     let timeout = clock
         .deadline
         .saturating_duration_since(Instant::now())
@@ -510,7 +520,7 @@ fn consume_until_settled(
     terminal: &mut TerminalCore,
     ansi: &mut Vec<u8>,
     host: &mut Host,
-    semantic: &mut semantic::Host,
+    semantic: &mut Option<semantic::Host>,
     options: &Options,
     clock: &mut Clock,
 ) -> Result<bool> {
@@ -841,7 +851,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn launched_commands_receive_the_application_semantic_socket() {
+    fn only_opentui_host_commands_receive_the_application_semantic_socket() {
         let command = [
             "sh".to_owned(),
             "-c".to_owned(),
@@ -851,7 +861,7 @@ mod tests {
             ),
         ];
 
-        let pty = from_command(
+        let plain_pty = from_command(
             &command,
             None,
             &Options {
@@ -861,7 +871,7 @@ mod tests {
             },
         )
         .unwrap();
-        let pipe = from_pipe_command(
+        let plain_pipe = from_pipe_command(
             &command,
             None,
             &Options {
@@ -870,9 +880,32 @@ mod tests {
             },
         )
         .unwrap();
+        let opentui_pty = from_command(
+            &command,
+            None,
+            &Options {
+                settle: Duration::from_millis(10),
+                deadline: Duration::from_secs(2),
+                opentui_host: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        let opentui_pipe = from_pipe_command(
+            &command,
+            None,
+            &Options {
+                deadline: Duration::from_secs(2),
+                opentui_host: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
 
-        assert_eq!(pty.frame.text(), "semantic-ready");
-        assert_eq!(pipe.frame.text(), "semantic-ready");
+        assert_eq!(plain_pty.frame.text(), "semantic-missing");
+        assert_eq!(plain_pipe.frame.text(), "semantic-missing");
+        assert_eq!(opentui_pty.frame.text(), "semantic-ready");
+        assert_eq!(opentui_pipe.frame.text(), "semantic-ready");
     }
 
     #[cfg(unix)]

@@ -18,10 +18,11 @@ const terminalControl = provideTerminalControl(renderer, {
 renderer.once("destroy", () => terminalControl.close())
 ```
 
-Outside Terminal Control the integration is a no-op. Inside a named session, inspect the semantic
-tree with:
+Outside Terminal Control the integration is a no-op. Launch the application with Terminal Control's
+OpenTUI host profile, then inspect the semantic tree:
 
 ```bash
+termctrl start app --host opentui -- my-tui
 termctrl show app --format semantic
 ```
 

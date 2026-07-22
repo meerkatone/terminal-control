@@ -142,10 +142,12 @@ Full-screen alternate-screen TUIs do not produce useful logs; read their visible
 
 ## Semantic UI Snapshots
 
-Terminal Control gives every launched application a private `TERMCTRL_SEMANTIC_SOCKET`. Applications
-may connect to it and provide structured UI semantics without changing terminal output:
+Terminal Control gives applications launched with `--host opentui` a private
+`TERMCTRL_SEMANTIC_SOCKET`. Applications may connect to it and provide structured UI semantics
+without changing terminal output:
 
 ```bash
+termctrl start demo --host opentui -- my-tui
 termctrl show demo --format semantic
 ```
 
@@ -328,7 +330,6 @@ See [docs/typescript-client.md](docs/typescript-client.md) for artifacts, record
 ## Notes
 
 - Persistent sessions use owner-only local Unix sockets and are supported on macOS and Linux.
-- Every launched command receives a private semantic provider path in `TERMCTRL_SEMANTIC_SOCKET`.
-- `--host opentui` answers startup probes needed by current OpenTUI applications.
+- `--host opentui` provides `TERMCTRL_SEMANTIC_SOCKET` and answers startup probes needed by current OpenTUI applications.
 - Terminal state and reflow use the statically linked Ghostty terminal core; renderers export PNG, SVG, JSON, text, and raw ANSI artifacts.
 - Run `termctrl <command> --help` for dimensions, timing, color, rendering, and output options.
