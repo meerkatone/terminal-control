@@ -18,10 +18,17 @@ mod implementation {
         match fs::symlink_metadata(&path) {
             Ok(metadata) => require_private_directory(&path, &metadata)?,
             Err(error) if error.kind() == ErrorKind::NotFound => {
-                fs::DirBuilder::new()
-                    .mode(0o700)
-                    .create(&path)
-                    .with_context(|| format!("create {}", path.display()))?;
+                match fs::DirBuilder::new().mode(0o700).create(&path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                        let metadata = fs::symlink_metadata(&path)
+                            .with_context(|| format!("inspect {}", path.display()))?;
+                        require_private_directory(&path, &metadata)?;
+                    }
+                    Err(error) => {
+                        return Err(error).with_context(|| format!("create {}", path.display()));
+                    }
+                }
             }
             Err(error) => {
                 return Err(error).with_context(|| format!("inspect {}", path.display()));
