@@ -1843,7 +1843,7 @@ mod implementation {
     use std::io::{ErrorKind, Read, Write};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
+    use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::os::unix::process::CommandExt;
     use std::path::{Path, PathBuf};
@@ -1977,40 +1977,7 @@ mod implementation {
         }
     }
     pub fn runtime_dir() -> Result<PathBuf> {
-        let path = std::env::var_os("TERMCTRL_RUNTIME_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                PathBuf::from(format!("/tmp/termctrl-{}", unsafe { libc::geteuid() }))
-            });
-        match fs::symlink_metadata(&path) {
-            Ok(metadata) => require_private_runtime_dir(&path, &metadata)?,
-            Err(error) if error.kind() == ErrorKind::NotFound => {
-                fs::DirBuilder::new()
-                    .mode(0o700)
-                    .create(&path)
-                    .with_context(|| format!("create {}", path.display()))?;
-            }
-            Err(error) => return Err(error).with_context(|| format!("inspect {}", path.display())),
-        }
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
-            .with_context(|| format!("secure {}", path.display()))?;
-        Ok(path)
-    }
-
-    fn require_private_runtime_dir(path: &Path, metadata: &fs::Metadata) -> Result<()> {
-        if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
-            bail!(
-                "session runtime path must be a real directory: {}",
-                path.display()
-            );
-        }
-        if metadata.uid() != unsafe { libc::geteuid() } {
-            bail!(
-                "session runtime directory is not owned by the current user: {}",
-                path.display()
-            );
-        }
-        Ok(())
+        crate::runtime::directory()
     }
 
     pub fn start(
