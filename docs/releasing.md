@@ -44,6 +44,17 @@ binaries for arm64 and x64, verifies the complete fixed-version tarball set, and
 client from clean Bun and Node/Vitest consumers. It also installs the packed OpenTUI adapter into
 clean consumers against the oldest and newest supported OpenTUI versions.
 
+## Bootstrap A New npm Package
+
+npm cannot configure a trusted publisher before a package exists. Before the adapter's first normal
+release workflow, download its already validated tarball, publish that exact artifact once with a
+short-lived bootstrap credential, configure `anomalyco/terminal-control` and `npm-release.yml` as its
+trusted publisher with a security key, then revoke the credential. Do not publish a separately
+rebuilt package directory.
+
+The aligned publisher checks or publishes the adapter before the established packages, so a missing
+bootstrap or OIDC binding fails before it can partially publish the fixed group.
+
 ## Publish
 
 Publishing is an irreversible public release. From the validated release commit:
@@ -78,8 +89,3 @@ Install the released package in a clean consumer and confirm `termctrl --version
 Each npm package, including the OpenTUI adapter, must configure `anomalyco/terminal-control` and
 workflow `npm-release.yml` as its trusted publisher. The publish job uses Node 24, current npm, and
 `id-token: write`; it does not use a long-lived npm token.
-
-npm cannot configure a trusted publisher before a package exists. For the adapter's first release,
-publish its already validated tarball once with a short-lived bootstrap credential, configure the
-trusted publisher on npmjs.com with a security key, then revoke the credential before running the
-normal OIDC workflow. Do not publish a separately rebuilt package directory for the bootstrap.

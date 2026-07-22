@@ -78,6 +78,9 @@ test("excludes hidden descendants from labels and reports clipped geometry", asy
   const secret = new BoxRenderable(setup.renderer, { visible: false, width: 5, height: 1 })
   Reflect.set(secret, "plainText", "secret")
   button.add(secret)
+  const faded = new BoxRenderable(setup.renderer, { opacity: 0, width: 5, height: 1 })
+  Reflect.set(faded, "plainText", "faded secret")
+  button.add(faded)
   const clipped = new BoxRenderable(setup.renderer, { id: "clip", overflow: "hidden", width: 5, height: 1 })
   const partial = new BoxRenderable(setup.renderer, {
     id: "partial",
@@ -94,6 +97,50 @@ test("excludes hidden descendants from labels and reports clipped geometry", asy
 
   expect(semanticSnapshot(setup.renderer).nodes.find((node) => node.id === "button")?.label).toBe("button")
   expect(elements(setup.renderer).find((element) => element.id === "partial")).toMatchObject({ x: 4, width: 1 })
+  setup.renderer.destroy()
+})
+
+test("omits controls with zero effective opacity", async () => {
+  const setup = await createTestRenderer({ width: 20, height: 5 })
+  const transparent = new BoxRenderable(setup.renderer, {
+    id: "transparent",
+    focusable: true,
+    opacity: 0,
+    width: 5,
+    height: 1,
+  })
+  const parent = new BoxRenderable(setup.renderer, { id: "transparent-parent", opacity: 0, width: 5, height: 1 })
+  parent.add(new BoxRenderable(setup.renderer, { id: "transparent-child", focusable: true, width: 5, height: 1 }))
+  setup.renderer.root.add(transparent)
+  setup.renderer.root.add(parent)
+  await setup.renderOnce()
+
+  expect(semanticSnapshot(setup.renderer).nodes).toEqual([])
+  setup.renderer.destroy()
+})
+
+test("keeps mouse controls reachable outside an occluded midpoint", async () => {
+  const setup = await createTestRenderer({ width: 20, height: 5 })
+  const button = new BoxRenderable(setup.renderer, {
+    id: "wide-button",
+    width: 10,
+    height: 1,
+    onMouseDown: () => {},
+  })
+  const overlay = new BoxRenderable(setup.renderer, {
+    id: "overlay",
+    position: "absolute",
+    left: 4,
+    width: 2,
+    height: 1,
+    zIndex: 1,
+    onMouseDown: () => {},
+  })
+  setup.renderer.root.add(button)
+  setup.renderer.root.add(overlay)
+  await setup.renderOnce()
+
+  expect(elements(setup.renderer).find((element) => element.id === "wide-button")?.clickable).toBe(true)
   setup.renderer.destroy()
 })
 

@@ -27,7 +27,9 @@ const versions = new Set([...tarballs.values()].map(({ version }) => version))
 if (versions.size !== 1) {
   throw new Error(`npm package versions are not aligned: ${[...versions].join(", ")}`)
 }
-for (const name of [...nativePackages.map((entry) => entry.name), clientPackage, opentuiPackage]) {
+// Publish the new adapter first so a missing first-release OIDC binding cannot partially publish
+// the established fixed group. Exact versions already present are skipped on retries.
+for (const name of [opentuiPackage, ...nativePackages.map((entry) => entry.name), clientPackage]) {
   const { file, version } = tarballs.get(name)
   if (!checkOnly && !isPublished(name, version)) publish(resolve(directory, file))
 }

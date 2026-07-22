@@ -103,7 +103,7 @@ The second command writes `captures/model.png` and `captures/model.txt`. Raw ANS
 Use a named session when several interactions target the same running application:
 
 ```bash
-termctrl start demo --cols 112 --rows 34 -- my-terminal-app
+termctrl start demo --host opentui --cols 112 --rows 34 -- my-terminal-app
 termctrl wait demo "Ready"
 termctrl send demo text:help enter
 termctrl show demo

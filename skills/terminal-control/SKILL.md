@@ -101,7 +101,10 @@ transition needs quiet-output settling.
 
 The `show` command takes an option `--format semantic` which returns a semantic tree representing the
 interactable UI elements. This requires direct support from the application to work; once the app is ready
-you can run this and see if it returns anything. If it does not, never try again for that session.
+you can run this and see if it returns anything. An empty tree means no provider was connected at that
+moment. If the application is still starting, wait for visible readiness and retry once; otherwise use
+the visible screen instead. Treat protocol and provider errors as actionable failures rather than retrying
+them blindly.
 The application must be launched with `--host opentui`; the full read command is
 `termctrl show app --format semantic`.
 

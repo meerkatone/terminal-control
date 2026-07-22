@@ -45,10 +45,13 @@ function hasMouseListeners(renderable: Renderable) {
 function receivesClick(renderer: CliRenderer, renderable: Renderable) {
   const bounds = visibleBounds(renderer, renderable)
   if (!bounds) return false
-  const x = Math.floor(bounds.x + bounds.width / 2)
-  const y = Math.floor(bounds.y + bounds.height / 2)
-  const target = renderer.hitTest(x, y)
-  return all(renderable).some((item) => item.num === target)
+  const targets = new Set(all(renderable).map((item) => item.num))
+  for (let y = Math.floor(bounds.y); y < Math.ceil(bounds.y + bounds.height); y++) {
+    for (let x = Math.floor(bounds.x); x < Math.ceil(bounds.x + bounds.width); x++) {
+      if (targets.has(renderer.hitTest(x, y))) return true
+    }
+  }
+  return false
 }
 
 export function elements(renderer: CliRenderer): InteractableElement[] {
@@ -94,7 +97,13 @@ export function semanticSnapshot(renderer: CliRenderer): SemanticSnapshot {
 }
 
 function visibleBounds(renderer: CliRenderer, renderable: Renderable) {
-  if (renderable.isDestroyed || !renderable.visible || renderable.width <= 0 || renderable.height <= 0) {
+  if (
+    renderable.isDestroyed ||
+    !renderable.visible ||
+    renderable.opacity <= 0 ||
+    renderable.width <= 0 ||
+    renderable.height <= 0
+  ) {
     return undefined
   }
   let left = Math.max(0, renderable.screenX)
@@ -102,7 +111,7 @@ function visibleBounds(renderer: CliRenderer, renderable: Renderable) {
   let right = Math.min(renderer.width, renderable.screenX + renderable.width)
   let bottom = Math.min(renderer.height, renderable.screenY + renderable.height)
   for (let parent = renderable.parent; parent; parent = parent.parent) {
-    if (parent.isDestroyed || !parent.visible) return undefined
+    if (parent.isDestroyed || !parent.visible || parent.opacity <= 0) return undefined
     if (parent.overflow !== "visible") {
       left = Math.max(left, parent.screenX)
       top = Math.max(top, parent.screenY)
