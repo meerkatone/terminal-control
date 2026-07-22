@@ -82,8 +82,10 @@ function required(files, prefix) {
 
 function requiredClient(files) {
   const nativePrefixes = nativePackages.map(({ target }) => `kitlangton-terminal-control-${target}-`)
+  const opentuiPrefix = "kitlangton-terminal-control-opentui-"
   const matches = files.filter((file) => file.startsWith("kitlangton-terminal-control-")
     && file.endsWith(".tgz")
+    && !file.startsWith(opentuiPrefix)
     && !nativePrefixes.some((prefix) => file.startsWith(prefix)))
   if (matches.length !== 1) throw new Error(`expected one Terminal Control client tarball, found ${matches.length}`)
   return matches[0]
