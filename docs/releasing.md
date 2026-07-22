@@ -2,9 +2,9 @@
 
 Terminal Control releases one aligned version across the public `terminal-control` crate, the
 `@kitlangton/terminal-control` client, the `@kitlangton/terminal-control-opentui` adapter, and four native npm
-packages. The adapter publishes from its package-local Node release script while the fixed native
-tarball set keeps its existing publisher. npm packages are published by the manual
-`npm-release.yml` workflow; crates.io publication and the GitHub release are separate explicit steps.
+packages. The manual `npm-release.yml` workflow builds and validates the complete aligned tarball
+set, then publishes those exact artifacts. crates.io publication and the GitHub release are separate
+explicit steps.
 
 ## Prepare The Version
 
@@ -21,9 +21,8 @@ have Changesets.
    `main` through CI.
 
 Native packaging rejects a Rust executable whose `termctrl --version` differs from its npm package
-manifest. The OpenTUI release script reads the TypeScript client version and updates its package
-manifest to match before publishing. Do not bypass the native checks or publish package formats at
-different versions.
+manifest. The OpenTUI manifest must already match the TypeScript client before publishing. Do not
+bypass the package-set checks or publish package formats at different versions.
 
 ## Validate The Release
 
@@ -42,8 +41,19 @@ gh workflow run npm-release.yml --ref main -f publish=false
 
 Confirm the workflow run targets the intended release commit. Its matrix builds macOS and Linux
 binaries for arm64 and x64, verifies the complete fixed-version tarball set, and installs the packed
-client from clean Bun and Node/Vitest consumers. The OpenTUI adapter validates independently with
-`bun run --cwd packages/opentui release:check`.
+client from clean Bun and Node/Vitest consumers. It also installs the packed OpenTUI adapter into
+clean consumers against the oldest and newest supported OpenTUI versions.
+
+## Bootstrap A New npm Package
+
+npm cannot configure a trusted publisher before a package exists. Before the adapter's first normal
+release workflow, download its already validated tarball, publish that exact artifact once with a
+short-lived bootstrap credential, configure `anomalyco/terminal-control` and `npm-release.yml` as its
+trusted publisher with a security key, then revoke the credential. Do not publish a separately
+rebuilt package directory.
+
+The aligned publisher checks or publishes the adapter before the established packages, so a missing
+bootstrap or OIDC binding fails before it can partially publish the fixed group.
 
 ## Publish
 
@@ -54,10 +64,10 @@ cargo publish --locked
 gh workflow run npm-release.yml --ref main -f publish=true
 ```
 
-The npm workflow runs `node scripts/release-packages.mjs`, which publishes the fixed native/client
-tarball set and then invokes the OpenTUI package's normal `npm publish`. Both publishers are
-retry-safe and skip an exact package version already present in npm. crates.io publication requires
-Cargo credentials for an owner of `terminal-control`; do not add registry tokens to the repository.
+The npm workflow runs `node scripts/release-packages.mjs`, which publishes the validated aligned
+tarball set. The publisher is retry-safe and skips an exact package version already present in npm.
+crates.io publication requires Cargo credentials for an owner of `terminal-control`; do not add
+registry tokens to the repository.
 
 After both registries report the new version, create the matching tag and GitHub release:
 

@@ -15,6 +15,7 @@ mod implementation {
             .unwrap_or_else(|| {
                 PathBuf::from(format!("/tmp/termctrl-{}", unsafe { libc::geteuid() }))
             });
+        require_absolute(&path)?;
         match fs::symlink_metadata(&path) {
             Ok(metadata) => require_private_directory(&path, &metadata)?,
             Err(error) if error.kind() == ErrorKind::NotFound => {
@@ -36,7 +37,7 @@ mod implementation {
         }
         fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
             .with_context(|| format!("secure {}", path.display()))?;
-        Ok(path)
+        fs::canonicalize(&path).with_context(|| format!("resolve {}", path.display()))
     }
 
     pub(crate) fn ensure_socket_path(path: &Path, kind: &str) -> Result<()> {
@@ -63,6 +64,27 @@ mod implementation {
             );
         }
         Ok(())
+    }
+
+    fn require_absolute(path: &Path) -> Result<()> {
+        if !path.is_absolute() {
+            bail!(
+                "TERMCTRL_RUNTIME_DIR must be an absolute path: {}",
+                path.display()
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn runtime_directory_must_be_absolute() {
+            let error = require_absolute(Path::new("runtime")).unwrap_err();
+            assert!(error.to_string().contains("must be an absolute path"));
+        }
     }
 }
 

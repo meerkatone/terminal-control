@@ -11,6 +11,11 @@ const terminalControl = JSON.parse(
 const check = process.argv.includes("--check")
 
 const aligned = manifest.version !== terminalControl.version
+if (aligned && !check) {
+  throw new Error(
+    `${manifest.name} is ${manifest.version}, but ${terminalControl.name} is ${terminalControl.version}; prepare the aligned release versions before publishing`,
+  )
+}
 if (aligned) {
   console.log(`aligning ${manifest.name} from ${manifest.version} to ${terminalControl.version}`)
   manifest.version = terminalControl.version

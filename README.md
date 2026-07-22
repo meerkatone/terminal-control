@@ -103,7 +103,7 @@ The second command writes `captures/model.png` and `captures/model.txt`. Raw ANS
 Use a named session when several interactions target the same running application:
 
 ```bash
-termctrl start demo --cols 112 --rows 34 -- my-terminal-app
+termctrl start demo --host opentui --cols 112 --rows 34 -- my-terminal-app
 termctrl wait demo "Ready"
 termctrl send demo text:help enter
 termctrl show demo
@@ -167,6 +167,9 @@ const semanticProvider = provideTerminalControl(renderer, {
 
 renderer.once("destroy", () => semanticProvider.close())
 ```
+
+See [docs/semantic-protocol.md](docs/semantic-protocol.md) for the versioned handshake, snapshot
+messages, limits, timeout behavior, and output contract.
 
 ## Enter A Shared Workspace
 
@@ -324,6 +327,7 @@ See [docs/typescript-client.md](docs/typescript-client.md) for artifacts, record
 
 - [docs/rust-library.md](docs/rust-library.md) — embed the shot engine and sessions in Rust, plus versioned JSON schemas.
 - [docs/driver-protocol.md](docs/driver-protocol.md) — the `termctrl driver` JSON Lines protocol for external tooling.
+- [docs/semantic-protocol.md](docs/semantic-protocol.md) — the application semantic socket handshake and snapshot contract.
 - [docs/typescript-client.md](docs/typescript-client.md) — the npm test client in full.
 - [docs/releasing.md](docs/releasing.md) — aligned crates.io, npm, and GitHub release process.
 

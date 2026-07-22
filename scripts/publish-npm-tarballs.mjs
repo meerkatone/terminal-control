@@ -7,7 +7,8 @@ const directory = resolve(process.argv[2] ?? "npm-artifacts")
 const checkOnly = process.argv.includes("--check")
 const files = (await readdir(directory)).filter((file) => file.endsWith(".tgz"))
 const clientPackage = "@kitlangton/terminal-control"
-const expected = [clientPackage, ...nativePackages.map((entry) => entry.name)]
+const opentuiPackage = "@kitlangton/terminal-control-opentui"
+const expected = [clientPackage, opentuiPackage, ...nativePackages.map((entry) => entry.name)]
 const tarballs = new Map()
 for (const file of files) {
   const manifest = manifestOf(resolve(directory, file))
@@ -26,7 +27,9 @@ const versions = new Set([...tarballs.values()].map(({ version }) => version))
 if (versions.size !== 1) {
   throw new Error(`npm package versions are not aligned: ${[...versions].join(", ")}`)
 }
-for (const name of [...nativePackages.map((entry) => entry.name), clientPackage]) {
+// Publish the new adapter first so a missing first-release OIDC binding cannot partially publish
+// the established fixed group. Exact versions already present are skipped on retries.
+for (const name of [opentuiPackage, ...nativePackages.map((entry) => entry.name), clientPackage]) {
   const { file, version } = tarballs.get(name)
   if (!checkOnly && !isPublished(name, version)) publish(resolve(directory, file))
 }

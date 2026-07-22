@@ -33,11 +33,5 @@ numeric element handles without requiring every application to maintain its own 
 `elements(renderer)` and `semanticSnapshot(renderer)` are also exported for tests and custom
 integrations.
 
-Publish the package directly from this directory:
-
-```bash
-npm publish --access public
-```
-
-The repository-level `npm run release-packages` command calls this package's retry-safe `release`
-script after publishing the native Terminal Control package set.
+This package is released with Terminal Control's fixed-version package group. See the repository's
+`docs/releasing.md` process rather than publishing this directory directly.

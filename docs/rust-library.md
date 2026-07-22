@@ -35,6 +35,26 @@ session.stop()?;
 
 `session::Session` is the embedded lifecycle interface; the flat named-session CLI commands and the external driver are adapters over the same implementation.
 
+To request optional application semantics, enable the OpenTUI host profile before launch and read
+the provider with the same embedded session:
+
+```rust
+use std::time::Duration;
+
+let mut options = terminal_control::shot::Options::default();
+options.opentui_host = true;
+let mut session = terminal_control::session::Session::start(
+    &["my-opentui-app".to_owned()],
+    None,
+    None,
+    &options,
+)?;
+let semantics = session.semantic_snapshot(Duration::from_secs(1))?;
+```
+
+No connected provider returns `termctrl-semantic-snapshot-v1` with an empty `nodes` array. See
+[semantic-protocol.md](semantic-protocol.md) for the application-side wire contract.
+
 ## Versioned Structured Output
 
 - A `save --format json` capture is a `Frame` object with `version: 1`, described by `schemas/frame-v1.schema.json`.
