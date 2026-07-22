@@ -107,6 +107,7 @@ termctrl start demo --cols 112 --rows 34 -- my-terminal-app
 termctrl wait demo "Ready"
 termctrl send demo text:help enter
 termctrl show demo
+termctrl show demo --format semantic
 termctrl save demo --format png --out captures/help.png
 termctrl stop demo
 ```
@@ -118,6 +119,7 @@ termctrl stop demo
   running sessions; `list --all` also shows retained exited sessions and stale sockets.
 - `prune --dry-run` previews retained exited sessions and stale sockets; `prune` removes them without
   deleting recording artifacts.
+- `show --format semantic` reads optional structured UI semantics provided by the application.
 - `resize demo --cols 132 --rows 38` tests responsive layouts.
 - `restart demo` relaunches with the stored command, cwd, viewport, and recording settings.
 - An exited session keeps its final screen for `show` until stopped.
@@ -137,6 +139,34 @@ termctrl logs demo --ansi > captures/demo-output.ansi
 ```
 
 Full-screen alternate-screen TUIs do not produce useful logs; read their visible screen with `show`.
+
+## Semantic UI Snapshots
+
+Terminal Control gives applications launched with `--host opentui` a private
+`TERMCTRL_SEMANTIC_SOCKET`. Applications may connect to it and provide structured UI semantics
+without changing terminal output:
+
+```bash
+termctrl start demo --host opentui -- my-tui
+termctrl show demo --format semantic
+```
+
+Applications that do not implement the protocol continue to work normally; semantic output is an
+empty snapshot. OpenTUI applications can install the adapter package and pass their live renderer:
+
+```bash
+bun add @kitlangton/terminal-control-opentui
+```
+
+```ts
+import { provideTerminalControl } from "@kitlangton/terminal-control-opentui"
+
+const semanticProvider = provideTerminalControl(renderer, {
+  application: { name: "my-tui", version: "1.0.0" },
+})
+
+renderer.once("destroy", () => semanticProvider.close())
+```
 
 ## Enter A Shared Workspace
 
@@ -300,6 +330,6 @@ See [docs/typescript-client.md](docs/typescript-client.md) for artifacts, record
 ## Notes
 
 - Persistent sessions use owner-only local Unix sockets and are supported on macOS and Linux.
-- `--host opentui` answers startup probes needed by current OpenTUI applications.
+- `--host opentui` provides `TERMCTRL_SEMANTIC_SOCKET` and answers startup probes needed by current OpenTUI applications.
 - Terminal state and reflow use the statically linked Ghostty terminal core; renderers export PNG, SVG, JSON, text, and raw ANSI artifacts.
 - Run `termctrl <command> --help` for dimensions, timing, color, rendering, and output options.

@@ -7,12 +7,14 @@ use std::time::{Duration, Instant};
 
 use crate::frame::Frame;
 use crate::recording::{self, InputOrigin};
+use crate::semantic;
 use crate::shot::{self, Host, Options, Shot, respond_to_output};
 use crate::terminal_core::{InputModes, SCROLLBACK_ROWS, TerminalCore};
 use crate::terminal_theme::TerminalTheme;
 use anyhow::{Context, Result, bail};
 use portable_pty::{Child, CommandBuilder, ExitStatus, MasterPty, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 pub use crate::workspace::{ActivityKind, WorkspaceContext};
 pub use crate::workspace::{Direction as PaneDirection, PaneStatus, TabPosition, WindowStatus};
@@ -26,7 +28,8 @@ const ATTACH_PROTOCOL_VERSION: u8 = 2;
 const WINDOW_PROTOCOL_VERSION: u8 = 3;
 const LAYOUT_COMMAND_PROTOCOL_VERSION: u8 = 4;
 const WORKSPACE_CONTROL_PROTOCOL_VERSION: u8 = 5;
-const CURRENT_PROTOCOL_VERSION: u8 = WORKSPACE_CONTROL_PROTOCOL_VERSION;
+const SEMANTIC_PROTOCOL_VERSION: u8 = 6;
+const CURRENT_PROTOCOL_VERSION: u8 = SEMANTIC_PROTOCOL_VERSION;
 const ATTACHED_TERMINAL_ERROR: &str = "workspace already has an attached terminal";
 
 fn attachment_rejection(name: &str, error: &str) -> anyhow::Error {
@@ -80,6 +83,7 @@ pub struct Session {
     cell_height: u16,
     launch: SessionLaunch,
     mirror: Option<Box<dyn Write + Send>>,
+    semantic: Option<semantic::Host>,
 }
 
 /// Lifecycle state of a running or completed session.
@@ -234,9 +238,16 @@ impl Session {
                 pixel_height: options.cell_height,
             })
             .context("open session pseudo-terminal")?;
+        let semantic = options
+            .opentui_host
+            .then(semantic::Host::bind)
+            .transpose()?;
         let mut builder = CommandBuilder::new(&command[0]);
         builder.args(&command[1..]);
         shot::configure_pty_environment(&mut builder, options);
+        if let Some(path) = semantic.as_ref().and_then(semantic::Host::path) {
+            builder.env(semantic::SOCKET_ENV, path);
+        }
         builder.cwd(&cwd);
         let mut reader = pair
             .master
@@ -317,6 +328,7 @@ impl Session {
                 color: options.color,
             },
             mirror: None,
+            semantic,
         })
     }
 
@@ -518,6 +530,23 @@ impl Session {
         self.terminal.scrollback_text()
     }
 
+    /// Return the application's semantic UI snapshot, or an empty snapshot when unavailable.
+    pub fn semantic_snapshot(&mut self, timeout: Duration) -> Result<Value> {
+        let Some(mut semantic) = self.semantic.take() else {
+            return Ok(semantic::empty_semantic_snapshot());
+        };
+        let result = semantic
+            .snapshot(timeout, || {
+                self.consume_output_batch()?;
+                Ok(self.has_exited()? || self.stopped)
+            })
+            .map(|snapshot| snapshot.unwrap_or_else(semantic::empty_semantic_snapshot));
+        if self.exit.is_none() && !self.stopped {
+            self.semantic = Some(semantic);
+        }
+        result
+    }
+
     /// Resize the PTY and reflow subsequent terminal parsing at the new dimensions.
     pub fn resize(
         &mut self,
@@ -621,6 +650,13 @@ impl Session {
     }
 
     fn consume_batch(&mut self) -> Result<()> {
+        if let Some(semantic) = &mut self.semantic {
+            semantic.pump();
+        }
+        self.consume_output_batch()
+    }
+
+    fn consume_output_batch(&mut self) -> Result<()> {
         let mut outputs = Vec::new();
         for _ in 0..OUTPUT_BATCH {
             match self.receive.try_recv() {
@@ -750,6 +786,7 @@ impl Session {
         self.output_closed = true;
         self.stopped = true;
         self.exit_ready = self.exit.is_some();
+        self.semantic.take();
     }
 
     fn finish_exited_output(&mut self) -> Result<()> {
@@ -792,6 +829,7 @@ impl Session {
             self.process_group.take();
         }
         self.exit_ready = true;
+        self.semantic.take();
         Ok(())
     }
 
@@ -994,6 +1032,13 @@ enum Request {
         cell_width: u16,
         cell_height: u16,
     },
+    SemanticSnapshot {
+        deadline_unix_ms: u64,
+        #[serde(default)]
+        pane: Option<crate::workspace::PaneId>,
+        #[serde(default)]
+        window: Option<String>,
+    },
     Stop,
 }
 
@@ -1004,6 +1049,7 @@ enum ProtocolCapability {
     Window,
     LayoutCommand,
     WorkspaceControl,
+    Semantic,
 }
 
 impl ProtocolCapability {
@@ -1014,6 +1060,7 @@ impl ProtocolCapability {
             Self::Window => WINDOW_PROTOCOL_VERSION,
             Self::LayoutCommand => LAYOUT_COMMAND_PROTOCOL_VERSION,
             Self::WorkspaceControl => WORKSPACE_CONTROL_PROTOCOL_VERSION,
+            Self::Semantic => SEMANTIC_PROTOCOL_VERSION,
         }
     }
 
@@ -1033,6 +1080,9 @@ impl ProtocolCapability {
             }
             Self::WorkspaceControl => {
                 "running workspace predates runtime workspace controls; restart it with the current termctrl"
+            }
+            Self::Semantic => {
+                "running session predates semantic snapshots; restart it with the current termctrl"
             }
         }
     }
@@ -1084,6 +1134,7 @@ impl Request {
             | Self::FocusPane { .. }
             | Self::ClosePane { .. } => ProtocolCapability::Pane,
             Self::Attach { .. } | Self::ResizeAttachment { .. } => ProtocolCapability::Attachment,
+            Self::SemanticSnapshot { .. } => ProtocolCapability::Semantic,
             Self::Ping
             | Self::Status
             | Self::Wait { pane: None, .. }
@@ -1120,6 +1171,8 @@ struct Response {
     windows: Option<Vec<crate::workspace::WindowStatus>>,
     #[serde(default)]
     context: Option<WorkspaceContext>,
+    #[serde(default)]
+    semantic_snapshot: Option<SemanticSnapshotResult>,
 }
 
 impl Default for Response {
@@ -1133,8 +1186,14 @@ impl Default for Response {
             panes: None,
             windows: None,
             context: None,
+            semantic_snapshot: None,
         }
     }
+}
+
+#[derive(Serialize, Deserialize)]
+struct SemanticSnapshotResult {
+    value: Value,
 }
 
 impl Response {
@@ -1383,6 +1442,38 @@ pub fn show_in(
     deadline: Duration,
 ) -> Result<Shot> {
     show_target(name, terminal_target(window, pane)?, settle, deadline)
+}
+
+#[doc(hidden)]
+pub fn semantic_snapshot_in(
+    name: &str,
+    window: Option<String>,
+    pane: Option<crate::workspace::PaneId>,
+    timeout: Duration,
+) -> Result<Value> {
+    validate_name(name)?;
+    let (window, pane) = match terminal_target(window, pane)? {
+        TerminalTarget::Selected => (None, None),
+        TerminalTarget::Window(window) => (Some(window), None),
+        TerminalTarget::Pane(pane) => (None, Some(pane)),
+    };
+    let response = semantic::request_snapshot(
+        &socket_path(name)?,
+        &Request::SemanticSnapshot {
+            deadline_unix_ms: semantic::deadline_unix_ms(timeout)?,
+            pane,
+            window,
+        },
+        timeout,
+    )?;
+    ProtocolCapability::Semantic.require(&response)?;
+    if let Some(error) = response.error {
+        bail!(error);
+    }
+    response
+        .semantic_snapshot
+        .map(|snapshot| snapshot.value)
+        .context("session did not return a semantic snapshot")
 }
 
 #[doc(hidden)]
@@ -1755,7 +1846,7 @@ mod implementation {
     use std::io::{ErrorKind, Read, Write};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
+    use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::os::unix::process::CommandExt;
     use std::path::{Path, PathBuf};
@@ -1769,7 +1860,7 @@ mod implementation {
 
     use super::{
         ATTACHED_TERMINAL_ERROR, NamedSessionStatus, ProtocolCapability, PruneKind, Request,
-        Response, Session, SessionState, TabPosition, UnavailableReason,
+        Response, SemanticSnapshotResult, Session, SessionState, TabPosition, UnavailableReason,
     };
     use crate::shot::{self, Options};
     use crate::workspace::{Workspace, WorkspaceAttachmentOptions, WorkspaceTerminal};
@@ -1889,40 +1980,7 @@ mod implementation {
         }
     }
     pub fn runtime_dir() -> Result<PathBuf> {
-        let path = std::env::var_os("TERMCTRL_RUNTIME_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                PathBuf::from(format!("/tmp/termctrl-{}", unsafe { libc::geteuid() }))
-            });
-        match fs::symlink_metadata(&path) {
-            Ok(metadata) => require_private_runtime_dir(&path, &metadata)?,
-            Err(error) if error.kind() == ErrorKind::NotFound => {
-                fs::DirBuilder::new()
-                    .mode(0o700)
-                    .create(&path)
-                    .with_context(|| format!("create {}", path.display()))?;
-            }
-            Err(error) => return Err(error).with_context(|| format!("inspect {}", path.display())),
-        }
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
-            .with_context(|| format!("secure {}", path.display()))?;
-        Ok(path)
-    }
-
-    fn require_private_runtime_dir(path: &Path, metadata: &fs::Metadata) -> Result<()> {
-        if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
-            bail!(
-                "session runtime path must be a real directory: {}",
-                path.display()
-            );
-        }
-        if metadata.uid() != unsafe { libc::geteuid() } {
-            bail!(
-                "session runtime directory is not owned by the current user: {}",
-                path.display()
-            );
-        }
-        Ok(())
+        crate::runtime::directory()
     }
 
     pub fn start(
@@ -2988,6 +3046,22 @@ mod implementation {
                 )?;
             }
             Request::Mark { name } => session.mark(&name)?,
+            Request::SemanticSnapshot {
+                deadline_unix_ms,
+                pane,
+                window,
+            } => {
+                if window.is_some() {
+                    bail!("only workspaces support named windows");
+                }
+                if pane.is_some_and(|pane| pane != 0) {
+                    bail!("single sessions only contain pane 0");
+                }
+                response.semantic_snapshot = Some(SemanticSnapshotResult {
+                    value: session
+                        .semantic_snapshot(crate::semantic::remaining(deadline_unix_ms)?)?,
+                });
+            }
             Request::Windows
             | Request::WorkspaceContext { .. }
             | Request::SetTabPosition { .. }
@@ -3087,6 +3161,19 @@ mod implementation {
                 bail!("visible workspace dimensions are owned by the attached terminal")
             }
             Request::Mark { name } => workspace.mark_recording(&name)?,
+            Request::SemanticSnapshot {
+                deadline_unix_ms,
+                pane,
+                window,
+            } => {
+                response.semantic_snapshot = Some(SemanticSnapshotResult {
+                    value: workspace.semantic_snapshot_in(
+                        window.as_deref(),
+                        pane,
+                        crate::semantic::remaining(deadline_unix_ms)?,
+                    )?,
+                });
+            }
             Request::Windows => response.windows = Some(workspace.windows()),
             Request::WorkspaceContext { pane } => {
                 response.context = Some(workspace.context(pane)?);
@@ -3636,7 +3723,11 @@ mod tests {
                 .require(&version_four)
                 .is_err()
         );
-        assert_eq!(Response::default().protocol_version, 5);
+        assert!(ProtocolCapability::Semantic.require(&version_four).is_err());
+        assert_eq!(
+            Response::default().protocol_version,
+            SEMANTIC_PROTOCOL_VERSION
+        );
     }
 
     #[test]
@@ -3680,6 +3771,15 @@ mod tests {
                     position: TabPosition::Top,
                 },
                 Some(ProtocolCapability::WorkspaceControl),
+                false,
+            ),
+            (
+                Request::SemanticSnapshot {
+                    deadline_unix_ms: 1,
+                    pane: None,
+                    window: None,
+                },
+                Some(ProtocolCapability::Semantic),
                 false,
             ),
             (Request::Status, None, false),
@@ -3766,6 +3866,11 @@ mod tests {
                 cell_width: 9,
                 cell_height: 18,
             },
+            Request::SemanticSnapshot {
+                deadline_unix_ms: 1,
+                pane: Some(3),
+                window: None,
+            },
         ] {
             let encoded = serde_json::to_vec(&request).unwrap();
             let decoded: Request = serde_json::from_slice(&encoded).unwrap();
@@ -3774,6 +3879,18 @@ mod tests {
                 serde_json::to_value(request).unwrap()
             );
         }
+    }
+
+    #[test]
+    fn named_session_response_preserves_a_null_semantic_snapshot() {
+        let encoded = serde_json::to_vec(&Response {
+            semantic_snapshot: Some(SemanticSnapshotResult { value: Value::Null }),
+            ..Response::default()
+        })
+        .unwrap();
+        let decoded: Response = serde_json::from_slice(&encoded).unwrap();
+
+        assert_eq!(decoded.semantic_snapshot.unwrap().value, Value::Null);
     }
 
     #[cfg(target_os = "macos")]
@@ -3846,6 +3963,100 @@ mod tests {
         session.stop().unwrap();
         assert_eq!(session.status().unwrap().state, SessionState::Exited);
         assert!(session.capture(Duration::ZERO, Duration::ZERO).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn embedded_session_advertises_and_cleans_up_the_application_semantic_socket() {
+        let mut session = Session::start(
+            &[
+                "sh".to_owned(),
+                "-c".to_owned(),
+                format!(
+                    "if [ -S \"${}\" ]; then printf semantic-ready; else printf semantic-missing; fi; sleep 10",
+                    semantic::SOCKET_ENV
+                ),
+            ],
+            None,
+            None,
+            &Options {
+                opentui_host: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        let path = session
+            .semantic
+            .as_ref()
+            .unwrap()
+            .path()
+            .unwrap()
+            .to_owned();
+
+        session
+            .wait_for_text("semantic-ready", Duration::from_secs(2))
+            .unwrap();
+        assert!(path.exists());
+        session.stop().unwrap();
+        assert!(!path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn embedded_session_reads_its_application_semantic_snapshot() {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::net::UnixStream;
+
+        let mut session = Session::start(
+            &["sh".to_owned(), "-c".to_owned(), "sleep 10".to_owned()],
+            None,
+            None,
+            &Options {
+                opentui_host: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        let path = session
+            .semantic
+            .as_ref()
+            .unwrap()
+            .path()
+            .unwrap()
+            .to_owned();
+        let (connected, ready) = mpsc::channel();
+        let application = thread::spawn(move || {
+            let mut stream = UnixStream::connect(path).unwrap();
+            stream
+                .write_all(
+                    b"{\"type\":\"hello\",\"protocolVersion\":1,\"application\":{\"name\":\"fixture\"},\"capabilities\":[\"semantic.snapshot\"]}\n",
+                )
+                .unwrap();
+            connected.send(()).unwrap();
+            let mut stream = BufReader::new(stream);
+            let mut line = String::new();
+            stream.read_line(&mut line).unwrap();
+            assert!(line.contains("\"type\":\"ready\""));
+            line.clear();
+            stream.read_line(&mut line).unwrap();
+            let request: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(request["type"], "semantic.snapshot");
+            let response = serde_json::json!({
+                "type": "result",
+                "id": request["id"],
+                "value": { "format": "termctrl-semantic-snapshot-v1", "nodes": [] }
+            });
+            serde_json::to_writer(stream.get_mut(), &response).unwrap();
+            stream.get_mut().write_all(b"\n").unwrap();
+            stream.get_mut().flush().unwrap();
+        });
+        ready.recv().unwrap();
+
+        let result = session.semantic_snapshot(Duration::from_secs(2)).unwrap();
+
+        assert_eq!(result["format"], "termctrl-semantic-snapshot-v1");
+        session.stop().unwrap();
+        application.join().unwrap();
     }
 
     #[cfg(unix)]

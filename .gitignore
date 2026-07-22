@@ -1,8 +1,8 @@
 /target
 /node_modules
-/packages/test/node_modules
+/packages/*/node_modules
 /packages/*/bin/cellshot
-/packages/test/dist
+/packages/*/dist
 /.cellshot-artifacts
 /npm-artifacts
 /captures

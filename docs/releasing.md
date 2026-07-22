@@ -1,9 +1,10 @@
 # Releasing Terminal Control
 
 Terminal Control releases one aligned version across the public `terminal-control` crate, the
-`@kitlangton/terminal-control` client, and four native npm packages. npm packages are assembled and
-published by the manual `npm-release.yml` workflow; crates.io publication and the GitHub release are
-separate explicit steps.
+`@kitlangton/terminal-control` client, the `@kitlangton/terminal-control-opentui` adapter, and four native npm
+packages. The adapter publishes from its package-local Node release script while the fixed native
+tarball set keeps its existing publisher. npm packages are published by the manual
+`npm-release.yml` workflow; crates.io publication and the GitHub release are separate explicit steps.
 
 ## Prepare The Version
 
@@ -20,7 +21,9 @@ have Changesets.
    `main` through CI.
 
 Native packaging rejects a Rust executable whose `termctrl --version` differs from its npm package
-manifest. Do not bypass that check or publish package formats at different versions.
+manifest. The OpenTUI release script reads the TypeScript client version and updates its package
+manifest to match before publishing. Do not bypass the native checks or publish package formats at
+different versions.
 
 ## Validate The Release
 
@@ -39,7 +42,8 @@ gh workflow run npm-release.yml --ref main -f publish=false
 
 Confirm the workflow run targets the intended release commit. Its matrix builds macOS and Linux
 binaries for arm64 and x64, verifies the complete fixed-version tarball set, and installs the packed
-client from clean Bun and Node/Vitest consumers.
+client from clean Bun and Node/Vitest consumers. The OpenTUI adapter validates independently with
+`bun run --cwd packages/opentui release:check`.
 
 ## Publish
 
@@ -50,9 +54,10 @@ cargo publish --locked
 gh workflow run npm-release.yml --ref main -f publish=true
 ```
 
-The npm workflow uses trusted publishing through GitHub Actions OIDC and is retry-safe: it skips an
-exact package version already present in npm. crates.io publication requires Cargo credentials for an
-owner of `terminal-control`; do not add registry tokens to the repository.
+The npm workflow runs `node scripts/release-packages.mjs`, which publishes the fixed native/client
+tarball set and then invokes the OpenTUI package's normal `npm publish`. Both publishers are
+retry-safe and skip an exact package version already present in npm. crates.io publication requires
+Cargo credentials for an owner of `terminal-control`; do not add registry tokens to the repository.
 
 After both registries report the new version, create the matching tag and GitHub release:
 
@@ -71,6 +76,6 @@ Install the released package in a clean consumer and confirm `termctrl --version
 
 ## Trusted Publishing
 
-Each npm package must configure `anomalyco/terminal-control` and workflow `npm-release.yml` as its
-trusted publisher. The publish job uses Node 24, current npm, and `id-token: write`; it does not use a
-long-lived npm token.
+Each npm package, including the OpenTUI adapter, must configure `anomalyco/terminal-control` and
+workflow `npm-release.yml` as its trusted publisher. The publish job uses Node 24, current npm, and
+`id-token: write`; it does not use a long-lived npm token.

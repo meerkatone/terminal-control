@@ -31,6 +31,9 @@ increment `protocolVersion`; clients reject unsupported versions rather than gue
 {"id":4,"method":"capture","sessionId":"app","params":{"settleMs":250,"deadlineMs":5000}}
 ```
 
+Set launch `host` to `"opentui"` for OpenTUI startup probe responses and the private
+`TERMCTRL_SEMANTIC_SOCKET` used by compatible semantic snapshot adapters.
+
 ## Capture Semantics
 
 A driver `capture` response contains a structured visible frame, derived `text`, and a completion `reason`: `idle`, `deadline`, `exited`, or `outputclosed`. A test client should normally require `idle` or `exited` instead of accepting a deadline fallback as a stable snapshot.

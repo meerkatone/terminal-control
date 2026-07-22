@@ -14,6 +14,8 @@ pub mod frame;
 pub mod mcp;
 pub mod recording;
 pub mod render;
+mod runtime;
+mod semantic;
 pub mod session;
 pub mod shot;
 mod terminal_core;

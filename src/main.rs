@@ -20,6 +20,7 @@ Examples:
   termctrl attach workspace
   termctrl wait demo '/connect' && termctrl send demo text:/connect enter
   termctrl show demo
+  termctrl show demo --format semantic
   termctrl save demo --format png --out captures/provider.png
   termctrl logs demo
   termctrl restart demo
@@ -35,7 +36,8 @@ Sources:
   termctrl show --input FILE            Read ANSI/VT bytes from FILE, or use - for stdin.
   termctrl show --recording FILE        Replay the final screen of a .termctrl recording.
 
-Use --format json, --format ansi, or --format svg for another stdout-readable representation.
+Use --format json, --format ansi, or --format svg for another terminal representation. Use
+`--format semantic` with a named target for optional application-provided UI semantics.
 Use `--at-marker NAME` or `--at-ms MS` with --recording to inspect an exact moment. Use `save`
 to write files.";
 
@@ -362,7 +364,7 @@ struct ShowArgs {
     render: RenderArgs,
     #[command(flatten)]
     source: SourceArgs,
-    /// Standard-output representation of the visible screen.
+    /// Standard-output representation of the visible screen or application semantics.
     #[arg(long, value_enum, default_value = "txt")]
     format: ShotFormat,
 }
@@ -919,6 +921,8 @@ enum ShotFormat {
     Json,
     /// Original ANSI/VT terminal stream.
     Ansi,
+    /// Application-provided semantic UI snapshot.
+    Semantic,
 }
 
 impl From<ColorMode> for shot_engine::ColorMode {
@@ -1119,6 +1123,9 @@ fn main() -> Result<()> {
 }
 
 fn show(args: ShowArgs) -> Result<()> {
+    if args.format == ShotFormat::Semantic {
+        return show_semantic(&args);
+    }
     if args.format == ShotFormat::Png {
         bail!("show does not support PNG output; use save --format png --out PATH");
     }
@@ -1127,8 +1134,27 @@ fn show(args: ShowArgs) -> Result<()> {
 }
 
 fn save(args: SaveArgs) -> Result<()> {
+    if args.formats.contains(&ShotFormat::Semantic) {
+        bail!("save does not support semantic output; use show NAME --format semantic");
+    }
     let captured = read_source(&args.source, &args.render)?;
     write_outputs(&captured, &args.render, &args.out, &args.formats)
+}
+
+fn show_semantic(args: &ShowArgs) -> Result<()> {
+    let source = &args.source;
+    let name = source
+        .name
+        .as_deref()
+        .context("semantic output requires a named session or workspace")?;
+    let timeout = Duration::from_millis(source.deadline_ms.unwrap_or(1000));
+    if timeout.is_zero() {
+        bail!("--deadline-ms must be greater than zero for semantic output");
+    }
+    let snapshot =
+        session::semantic_snapshot_in(name, source.window.clone(), source.pane, timeout)?;
+    println!("{}", serde_json::to_string_pretty(&snapshot)?);
+    Ok(())
 }
 
 fn read_source(args: &SourceArgs, render: &RenderArgs) -> Result<shot_engine::Shot> {
@@ -1802,6 +1828,7 @@ fn write_stdout(captured: &shot_engine::Shot, args: &RenderArgs, format: ShotFor
         ShotFormat::Ansi => captured.ansi.clone(),
         ShotFormat::Svg => rendered_svg(captured, args).into_bytes(),
         ShotFormat::Png => unreachable!("show validates PNG before reading source"),
+        ShotFormat::Semantic => unreachable!("show handles semantic output before reading source"),
     };
     io::stdout()
         .write_all(&bytes)
@@ -2066,6 +2093,7 @@ mod tests {
             Cli::try_parse_from(["termctrl", "show", "workspace", "--window", "editor"]).is_ok()
         );
         assert!(Cli::try_parse_from(["termctrl", "status", "demo", "--json"]).is_ok());
+        assert!(Cli::try_parse_from(["termctrl", "show", "demo", "--format", "semantic"]).is_ok());
         assert!(Cli::try_parse_from(["termctrl", "list"]).is_ok());
         assert!(Cli::try_parse_from(["termctrl", "list", "--all", "--json"]).is_ok());
         assert!(Cli::try_parse_from(["termctrl", "prune", "--dry-run"]).is_ok());
@@ -2083,6 +2111,18 @@ mod tests {
         assert!(
             Cli::try_parse_from(["termctrl", "wait", "demo", "ready", "--timeout", "5"]).is_ok()
         );
+    }
+
+    #[test]
+    fn parses_semantic_show_format() {
+        let cli =
+            Cli::try_parse_from(["termctrl", "show", "demo", "--format", "semantic"]).unwrap();
+        let Command::Show(args) = cli.command else {
+            panic!("expected show command");
+        };
+
+        assert_eq!(args.source.name.as_deref(), Some("demo"));
+        assert_eq!(args.format, ShotFormat::Semantic);
     }
 
     #[test]

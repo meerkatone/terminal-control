@@ -5,6 +5,7 @@
   "fixed": [
     [
       "@kitlangton/terminal-control",
+      "@kitlangton/terminal-control-opentui",
       "@kitlangton/terminal-control-darwin-arm64",
       "@kitlangton/terminal-control-darwin-x64",
       "@kitlangton/terminal-control-linux-arm64-gnu",

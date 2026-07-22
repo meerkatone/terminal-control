@@ -50,3 +50,7 @@ Agents inspect marker names with `termctrl markers` and inspect exact recording 
 ### ANSI/VT Stream
 
 Raw terminal output bytes containing text and terminal control sequences. Files commonly use an `.ansi` suffix, but the suffix does not imply a separate container format.
+
+### Semantic Snapshot
+
+Optional application-provided structured UI state read with `show --format semantic`. For applications launched with the OpenTUI host profile, Terminal Control advertises a private `TERMCTRL_SEMANTIC_SOCKET`; a cooperating application may expose one `semantic.snapshot` capability over it. No provider produces an empty snapshot. Semantic state describes interactable application elements and complements, but does not replace, visible terminal evidence from `show`. The OpenTUI adapter package derives snapshots consistently from a live renderer.
