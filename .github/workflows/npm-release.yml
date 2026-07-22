@@ -61,9 +61,28 @@ jobs:
           name: npm-test
           path: npm-artifacts/*.tgz
 
+  opentui:
+    name: OpenTUI adapter
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      - run: bun run --cwd packages/opentui typecheck
+      - run: bun run --cwd packages/opentui test
+      - run: mkdir -p npm-artifacts && npm pack ./packages/opentui --pack-destination npm-artifacts
+      - run: node scripts/validate-opentui-package.mjs npm-artifacts
+      - uses: actions/upload-artifact@v7
+        with:
+          name: npm-opentui
+          path: npm-artifacts/*.tgz
+
   validate:
     name: Validate publishable install
-    needs: [native, client]
+    needs: [native, client, opentui]
     strategy:
       matrix:
         include:
@@ -105,8 +124,6 @@ jobs:
           node-version: 24
           registry-url: https://registry.npmjs.org
       - run: npm install --global npm@latest
-      - run: npm install --ignore-scripts --no-package-lock --workspaces=false
-        working-directory: packages/opentui
       - uses: actions/download-artifact@v8
         with:
           pattern: npm-*

@@ -168,6 +168,9 @@ const semanticProvider = provideTerminalControl(renderer, {
 renderer.once("destroy", () => semanticProvider.close())
 ```
 
+See [docs/semantic-protocol.md](docs/semantic-protocol.md) for the versioned handshake, snapshot
+messages, limits, timeout behavior, and output contract.
+
 ## Enter A Shared Workspace
 
 `run` creates a persistent workspace when its name is absent and attaches the current terminal. Running the same name later reattaches to the existing panes. `attach` is the strict attach-only form:
@@ -324,6 +327,7 @@ See [docs/typescript-client.md](docs/typescript-client.md) for artifacts, record
 
 - [docs/rust-library.md](docs/rust-library.md) — embed the shot engine and sessions in Rust, plus versioned JSON schemas.
 - [docs/driver-protocol.md](docs/driver-protocol.md) — the `termctrl driver` JSON Lines protocol for external tooling.
+- [docs/semantic-protocol.md](docs/semantic-protocol.md) — the application semantic socket handshake and snapshot contract.
 - [docs/typescript-client.md](docs/typescript-client.md) — the npm test client in full.
 - [docs/releasing.md](docs/releasing.md) — aligned crates.io, npm, and GitHub release process.
 

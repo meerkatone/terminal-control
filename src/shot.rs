@@ -372,6 +372,9 @@ pub(crate) fn configure_pty_environment(builder: &mut CommandBuilder, options: &
     for (key, value) in &options.env {
         builder.env(key, value);
     }
+    // This endpoint belongs to the immediate Terminal Control host and must never leak
+    // into nested or non-hosted launches. Hosted call sites set their fresh path later.
+    builder.env_remove(semantic::SOCKET_ENV);
 }
 
 fn configure_process_environment(builder: &mut ProcessCommand, options: &Options) {
@@ -396,6 +399,7 @@ fn configure_process_environment(builder: &mut ProcessCommand, options: &Options
         }
     }
     builder.envs(&options.env);
+    builder.env_remove(semantic::SOCKET_ENV);
 }
 
 pub(crate) fn validate_geometry(rows: u16, cols: u16) -> Result<()> {
@@ -852,6 +856,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn only_opentui_host_commands_receive_the_application_semantic_socket() {
+        let inherited_socket = "/tmp/outer-termctrl-semantic.sock";
         let command = [
             "sh".to_owned(),
             "-c".to_owned(),
@@ -867,6 +872,10 @@ mod tests {
             &Options {
                 settle: Duration::from_millis(10),
                 deadline: Duration::from_secs(2),
+                env: BTreeMap::from([(
+                    semantic::SOCKET_ENV.to_owned(),
+                    inherited_socket.to_owned(),
+                )]),
                 ..Options::default()
             },
         )
@@ -876,6 +885,10 @@ mod tests {
             None,
             &Options {
                 deadline: Duration::from_secs(2),
+                env: BTreeMap::from([(
+                    semantic::SOCKET_ENV.to_owned(),
+                    inherited_socket.to_owned(),
+                )]),
                 ..Options::default()
             },
         )
@@ -887,6 +900,10 @@ mod tests {
                 settle: Duration::from_millis(10),
                 deadline: Duration::from_secs(2),
                 opentui_host: true,
+                env: BTreeMap::from([(
+                    semantic::SOCKET_ENV.to_owned(),
+                    inherited_socket.to_owned(),
+                )]),
                 ..Options::default()
             },
         )
@@ -897,6 +914,10 @@ mod tests {
             &Options {
                 deadline: Duration::from_secs(2),
                 opentui_host: true,
+                env: BTreeMap::from([(
+                    semantic::SOCKET_ENV.to_owned(),
+                    inherited_socket.to_owned(),
+                )]),
                 ..Options::default()
             },
         )

@@ -1143,6 +1143,32 @@ fn save(args: SaveArgs) -> Result<()> {
 
 fn show_semantic(args: &ShowArgs) -> Result<()> {
     let source = &args.source;
+    let render = &args.render;
+    if source.recording.is_some()
+        || source.at_marker.is_some()
+        || source.at_ms.is_some()
+        || source.cols.is_some()
+        || source.rows.is_some()
+        || source.pipe
+        || source.input.is_some()
+        || source.color.is_some()
+        || source.settle_ms.is_some()
+        || source.initial_delay_ms.is_some()
+        || source.wait_for.is_some()
+        || source.max_bytes.is_some()
+        || source.cwd.is_some()
+        || source.host.is_some()
+        || !source.send.is_empty()
+        || !source.command.is_empty()
+        || render.cell_width != 9
+        || render.cell_height != 18
+        || render.padding != 18.0
+        || render.font_family != "JetBrains Mono, SFMono-Regular, Menlo, monospace"
+        || render.pixel_ratio != 2.0
+        || render.hide_cursor
+    {
+        bail!("semantic output supports only NAME, --window, --pane, and --deadline-ms");
+    }
     let name = source
         .name
         .as_deref()
@@ -2123,6 +2149,28 @@ mod tests {
 
         assert_eq!(args.source.name.as_deref(), Some("demo"));
         assert_eq!(args.format, ShotFormat::Semantic);
+    }
+
+    #[test]
+    fn semantic_show_rejects_ignored_source_options() {
+        let cli = Cli::try_parse_from([
+            "termctrl",
+            "show",
+            "demo",
+            "--format",
+            "semantic",
+            "--",
+            "ignored-command",
+        ])
+        .unwrap();
+        let Command::Show(args) = cli.command else {
+            panic!("expected show command");
+        };
+
+        assert_eq!(
+            show_semantic(&args).unwrap_err().to_string(),
+            "semantic output supports only NAME, --window, --pane, and --deadline-ms"
+        );
     }
 
     #[test]

@@ -43,28 +43,31 @@ function hasMouseListeners(renderable: Renderable) {
 }
 
 function receivesClick(renderer: CliRenderer, renderable: Renderable) {
-  if (renderable.width <= 0 || renderable.height <= 0) return false
-  const x = Math.floor(renderable.screenX + renderable.width / 2)
-  const y = Math.floor(renderable.screenY + renderable.height / 2)
+  const bounds = visibleBounds(renderer, renderable)
+  if (!bounds) return false
+  const x = Math.floor(bounds.x + bounds.width / 2)
+  const y = Math.floor(bounds.y + bounds.height / 2)
   const target = renderer.hitTest(x, y)
   return all(renderable).some((item) => item.num === target)
 }
 
 export function elements(renderer: CliRenderer): InteractableElement[] {
   return all(renderer.root)
-    .filter((renderable) => renderable.visible && !renderable.isDestroyed)
-    .map((renderable) => ({
-      id: renderable.id,
-      num: renderable.num,
-      x: renderable.screenX,
-      y: renderable.screenY,
-      width: renderable.width,
-      height: renderable.height,
-      focusable: renderable.focusable,
-      focused: renderable.focused,
-      clickable: hasMouseListeners(renderable) && receivesClick(renderer, renderable),
-      editor: renderer.currentFocusedEditor === renderable,
-    }))
+    .flatMap((renderable) => {
+      const bounds = visibleBounds(renderer, renderable)
+      if (!bounds) return []
+      return [
+        {
+          id: renderable.id,
+          num: renderable.num,
+          ...bounds,
+          focusable: renderable.focusable,
+          focused: renderable.focused,
+          clickable: hasMouseListeners(renderable) && receivesClick(renderer, renderable),
+          editor: renderer.currentFocusedEditor === renderable,
+        },
+      ]
+    })
     .filter((element) => element.focusable || element.clickable || element.editor)
 }
 
@@ -75,18 +78,40 @@ export function semanticSnapshot(renderer: CliRenderer): SemanticSnapshot {
     format: "termctrl-semantic-snapshot-v1",
     nodes: elements(renderer).map((element) => {
       const preferred = element.id || `renderable-${element.num}`
-      const id = ids.has(preferred) ? `${preferred}-${element.num}` : preferred
+      let id = preferred
+      for (let suffix = element.num; ids.has(id); suffix++) id = `${preferred}-${suffix}`
       ids.add(id)
       return {
         id,
         role: element.editor ? "textbox" : element.clickable ? "button" : "control",
-        label: label(renderables.get(element.num), element),
+        label: label(renderer, renderables.get(element.num), element),
         element: element.num,
         focused: element.focused || element.editor,
         disabled: false,
       }
     }),
   }
+}
+
+function visibleBounds(renderer: CliRenderer, renderable: Renderable) {
+  if (renderable.isDestroyed || !renderable.visible || renderable.width <= 0 || renderable.height <= 0) {
+    return undefined
+  }
+  let left = Math.max(0, renderable.screenX)
+  let top = Math.max(0, renderable.screenY)
+  let right = Math.min(renderer.width, renderable.screenX + renderable.width)
+  let bottom = Math.min(renderer.height, renderable.screenY + renderable.height)
+  for (let parent = renderable.parent; parent; parent = parent.parent) {
+    if (parent.isDestroyed || !parent.visible) return undefined
+    if (parent.overflow !== "visible") {
+      left = Math.max(left, parent.screenX)
+      top = Math.max(top, parent.screenY)
+      right = Math.min(right, parent.screenX + parent.width)
+      bottom = Math.min(bottom, parent.screenY + parent.height)
+    }
+  }
+  if (right <= left || bottom <= top) return undefined
+  return { x: left, y: top, width: right - left, height: bottom - top }
 }
 
 export function provideTerminalControl(
@@ -107,9 +132,10 @@ export function provideTerminalControl(
   })
 }
 
-function label(renderable: Renderable | undefined, element: InteractableElement) {
+function label(renderer: CliRenderer, renderable: Renderable | undefined, element: InteractableElement) {
   if (!renderable || element.editor) return element.id || undefined
   const text = all(renderable)
+    .filter((item) => visibleBounds(renderer, item) !== undefined)
     .map((item) => Reflect.get(item, "plainText"))
     .find((value): value is string => typeof value === "string" && value.trim().length > 0)
   return text?.replaceAll(/\s+/g, " ").trim() || element.id || undefined

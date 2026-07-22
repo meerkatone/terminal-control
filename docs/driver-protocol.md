@@ -32,7 +32,8 @@ increment `protocolVersion`; clients reject unsupported versions rather than gue
 ```
 
 Set launch `host` to `"opentui"` for OpenTUI startup probe responses and the private
-`TERMCTRL_SEMANTIC_SOCKET` used by compatible semantic snapshot adapters.
+`TERMCTRL_SEMANTIC_SOCKET` used by compatible semantic snapshot adapters. The socket's separate
+application protocol is documented in [semantic-protocol.md](semantic-protocol.md).
 
 ## Capture Semantics
 

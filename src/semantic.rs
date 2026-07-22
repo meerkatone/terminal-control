@@ -61,6 +61,7 @@ mod implementation {
         pending: Option<PendingConnection>,
         connection: Option<Connection>,
         failure: Option<String>,
+        recoverable_failure: bool,
     }
 
     struct PendingConnection {
@@ -139,9 +140,16 @@ mod implementation {
     impl Host {
         pub(crate) fn bind() -> Result<Self> {
             let runtime = crate::runtime::directory()?;
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64;
             for _ in 0..100 {
                 let id = NEXT_SOCKET_ID.fetch_add(1, Ordering::Relaxed);
-                let path = runtime.join(format!("semantic-{}-{id}.semantic", std::process::id()));
+                let path = runtime.join(format!(
+                    "semantic-{}-{nonce:x}-{id}.semantic",
+                    std::process::id()
+                ));
                 crate::runtime::ensure_socket_path(&path, "application semantic socket")?;
                 let listener = match UnixListener::bind(&path) {
                     Ok(listener) => listener,
@@ -164,6 +172,7 @@ mod implementation {
                     pending: None,
                     connection: None,
                     failure: None,
+                    recoverable_failure: false,
                 });
             }
             bail!("could not allocate a unique application semantic socket")
@@ -187,6 +196,7 @@ mod implementation {
                 if read == 0 {
                     self.connection = None;
                     self.failure = Some("application semantic provider disconnected".to_owned());
+                    self.recoverable_failure = true;
                 } else if read > 0 {
                     return;
                 } else {
@@ -196,6 +206,7 @@ mod implementation {
                     }
                     self.connection = None;
                     self.failure = Some(format!("inspect application semantic provider: {error}"));
+                    self.recoverable_failure = true;
                 }
             }
             loop {
@@ -205,6 +216,7 @@ mod implementation {
                             self.failure = Some(format!(
                                 "configure application semantic connection: {error}"
                             ));
+                            self.recoverable_failure = false;
                             return;
                         }
                         self.pending = Some(PendingConnection {
@@ -217,6 +229,7 @@ mod implementation {
                     Err(error) => {
                         self.failure =
                             Some(format!("accept application semantic connection: {error}"));
+                        self.recoverable_failure = false;
                         return;
                     }
                 }
@@ -234,16 +247,19 @@ mod implementation {
                         "application disconnected before completing the semantic handshake"
                             .to_owned(),
                     );
+                    self.recoverable_failure = false;
                 }
                 Ok(HandshakeRead::Hello(hello)) => {
                     if let Err(error) = self.finish_handshake(hello) {
                         self.pending = None;
                         self.failure = Some(format!("{error:#}"));
+                        self.recoverable_failure = false;
                     }
                 }
                 Err(error) => {
                     self.pending = None;
                     self.failure = Some(format!("{error:#}"));
+                    self.recoverable_failure = false;
                 }
             }
         }
@@ -258,11 +274,25 @@ mod implementation {
             }
             self.pump();
             if !self.is_ready() && self.pending.is_none() {
-                return Ok(None);
+                if !self.recoverable_failure
+                    && let Some(failure) = self.failure()
+                {
+                    bail!("application semantic provider is unavailable: {failure}");
+                }
+                if self.failure().is_none() {
+                    return Ok(None);
+                }
             }
             let deadline = Instant::now() + timeout;
             loop {
                 self.pump();
+                if !self.is_ready()
+                    && self.pending.is_none()
+                    && !self.recoverable_failure
+                    && let Some(failure) = self.failure()
+                {
+                    bail!("application semantic provider is unavailable: {failure}");
+                }
                 if pump_session()? {
                     bail!("session ended before its application semantic provider became ready");
                 }
@@ -357,6 +387,7 @@ mod implementation {
             let result = start_snapshot(connection, id, deadline);
             if let Err(error) = &result {
                 self.failure = Some(error.to_string());
+                self.recoverable_failure = true;
                 self.connection = None;
             }
             result
@@ -370,6 +401,7 @@ mod implementation {
             let result = poll_snapshot(connection, id, deadline);
             if let Err(error) = &result {
                 self.failure = Some(error.to_string());
+                self.recoverable_failure = true;
                 self.connection = None;
             }
             result
@@ -377,6 +409,7 @@ mod implementation {
 
         fn abort_snapshot(&mut self, message: &str) {
             self.failure = Some(message.to_owned());
+            self.recoverable_failure = true;
             self.pending = None;
             self.connection = None;
         }
@@ -427,6 +460,7 @@ mod implementation {
                 pending_id: None,
             });
             self.failure = None;
+            self.recoverable_failure = false;
             Ok(())
         }
     }
@@ -930,6 +964,36 @@ mod implementation {
         }
 
         #[test]
+        fn invalid_provider_handshakes_remain_observable() {
+            let mut socket = Host::bind().unwrap();
+            let path = socket.path().unwrap().to_owned();
+            let application = thread::spawn(move || {
+                let mut stream = UnixStream::connect(path).unwrap();
+                write_json_line(
+                    &mut stream,
+                    &serde_json::json!({
+                        "type": "hello",
+                        "protocolVersion": 2,
+                        "application": { "name": "fixture" },
+                        "capabilities": ["semantic.snapshot"]
+                    }),
+                )
+                .unwrap();
+            });
+            application.join().unwrap();
+
+            let error = socket
+                .snapshot(Duration::from_secs(1), || Ok(false))
+                .unwrap_err();
+
+            assert!(
+                error
+                    .to_string()
+                    .contains("unsupported application semantic protocol")
+            );
+        }
+
+        #[test]
         fn newer_provider_replaces_an_incomplete_handshake() {
             let mut socket = Host::bind().unwrap();
             let path = socket.path().unwrap().to_owned();
@@ -986,6 +1050,56 @@ mod implementation {
             let second = connect_provider(path, "second");
             wait_until_ready(&mut socket);
             assert!(socket.is_ready());
+            second.join().unwrap();
+        }
+
+        #[test]
+        fn snapshot_waits_for_an_established_provider_to_reconnect() {
+            let mut socket = Host::bind().unwrap();
+            let path = socket.path().unwrap().to_owned();
+            let first = connect_provider(path.clone(), "first");
+            wait_until_ready(&mut socket);
+            first.join().unwrap();
+            while socket.is_ready() {
+                socket.pump();
+                thread::sleep(Duration::from_millis(1));
+            }
+            let second = thread::spawn(move || {
+                thread::sleep(Duration::from_millis(50));
+                let mut stream = UnixStream::connect(path).unwrap();
+                write_json_line(
+                    &mut stream,
+                    &serde_json::json!({
+                        "type": "hello",
+                        "protocolVersion": 1,
+                        "application": { "name": "second" },
+                        "capabilities": ["semantic.snapshot"]
+                    }),
+                )
+                .unwrap();
+                let mut stream = BufReader::new(stream);
+                let mut line = String::new();
+                stream.read_line(&mut line).unwrap();
+                line.clear();
+                stream.read_line(&mut line).unwrap();
+                let request = serde_json::from_str::<Value>(&line).unwrap();
+                write_json_line(
+                    stream.get_mut(),
+                    &serde_json::json!({
+                        "type": "result",
+                        "id": request["id"],
+                        "value": { "reconnected": true }
+                    }),
+                )
+                .unwrap();
+            });
+
+            let snapshot = socket
+                .snapshot(Duration::from_secs(1), || Ok(false))
+                .unwrap()
+                .unwrap();
+
+            assert_eq!(snapshot["reconnected"], true);
             second.join().unwrap();
         }
 
